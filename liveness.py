@@ -8,7 +8,9 @@ The algorithm has two phases:
 1. Postorder traversal of FL(G) (CFG without loop edges)
 2. Loop-nesting forest traversal to propagate liveness within loops
 """
+
 # todo: non reducible control flow
+from collections import defaultdict
 from typing import List, Dict, Set, Tuple
 from dataclasses import dataclass
 from ir import Function, Block, Op, Phi
@@ -17,10 +19,11 @@ from ir import Function, Block, Op, Phi
 @dataclass
 class LoopNode:
     """Represents a node in the loop-nesting forest."""
+
     block_name: str  # Name of the block (or loop header)
-    is_loop: bool    # True if this represents a loop header
-    children: List['LoopNode']
-    parent: 'LoopNode' = None
+    is_loop: bool  # True if this represents a loop header
+    children: List["LoopNode"]
+    parent: "LoopNode" = None
 
 
 def compute_predecessors_and_use_def_sets(function: Function) -> None:
@@ -64,10 +67,14 @@ def compute_predecessors_and_use_def_sets(function: Function) -> None:
             if successor in function.blocks:
                 function.blocks[successor].predecessors.append(block_name)
             else:
-                raise ValueError(f"Block '{block_name}' has successor '{successor}' that doesn't exist")
+                raise ValueError(
+                    f"Block '{block_name}' has successor '{successor}' that doesn't exist"
+                )
 
 
-def build_loop_forest(function: Function) -> Tuple[Dict[str, LoopNode], Set[Tuple[str, str]], Dict[str, Set[str]]]:
+def build_loop_forest(
+    function: Function,
+) -> Tuple[Dict[str, LoopNode], Set[Tuple[str, str]], Dict[str, Set[str]]]:
     """
     Build loop-nesting forest for reducible graphs and identify loop edges.
 
@@ -115,14 +122,13 @@ def build_loop_forest(function: Function) -> Tuple[Dict[str, LoopNode], Set[Tupl
 
         # Create LoopNode for this block
         loop_forest[block_name] = LoopNode(
-            block_name=block_name,
-            is_loop=block_name in loop_headers,
-            children=[]
+            block_name=block_name, is_loop=block_name in loop_headers, children=[]
         )
 
     # Find a root block (one with no predecessors)
-    root_candidates = [name for name, block in function.blocks.items()
-                      if not block.predecessors]
+    root_candidates = [
+        name for name, block in function.blocks.items() if not block.predecessors
+    ]
 
     if not root_candidates:
         # If no blocks have no predecessors, pick any block as root
@@ -139,7 +145,9 @@ def build_loop_forest(function: Function) -> Tuple[Dict[str, LoopNode], Set[Tupl
 
     # Compute loop membership
     loop_membership = {}
-    for loop_header in [node.block_name for node in loop_forest.values() if node.is_loop]:
+    for loop_header in [
+        node.block_name for node in loop_forest.values() if node.is_loop
+    ]:
         loop_blocks = {loop_header}
         # Add all sources of back edges to this header
         for src, tgt in back_edges:
@@ -157,7 +165,9 @@ def build_loop_forest(function: Function) -> Tuple[Dict[str, LoopNode], Set[Tupl
     return loop_forest, back_edges, loop_membership
 
 
-def compute_loop_exit_edges(loop_membership: Dict[str, Set[str]], function: Function) -> Set[Tuple[str, str]]:
+def compute_loop_exit_edges(
+    loop_membership: Dict[str, Set[str]], function: Function
+) -> Set[Tuple[str, str]]:
     """
     Identify loop exit edges.
 
@@ -187,14 +197,16 @@ def compute_loop_exit_edges(loop_membership: Dict[str, Set[str]], function: Func
             src_loops = block_to_loops.get(src_block_name, set())
             dst_loops = block_to_loops.get(dst_block_name, set())
 
-        # If src is in a loop but dst is not in any of the same loops, it's an exit edge
-        if src_loops and not dst_loops.intersection(src_loops):
-            exit_edges.add((src_block_name, dst_block_name))
+            # If src is in a loop but dst is not in any of the same loops, it's an exit edge
+            if src_loops and not dst_loops.intersection(src_loops):
+                exit_edges.add((src_block_name, dst_block_name))
 
     return exit_edges
 
 
-def postorder_traversal_reduced_cfg(function: Function, loop_edges: Set[Tuple[str, str]]) -> List[str]:
+def postorder_traversal_reduced_cfg(
+    function: Function, loop_edges: Set[Tuple[str, str]]
+) -> List[str]:
     """
     Perform postorder traversal of the reduced CFG FL(G) by building adjacency list on-the-fly
     while filtering out loop edges.
@@ -238,8 +250,11 @@ def postorder_traversal_reduced_cfg(function: Function, loop_edges: Set[Tuple[st
     return postorder
 
 
-def compute_initial_liveness(function: Function, loop_forest: Dict[str, LoopNode],
-                           loop_edges: Set[Tuple[str, str]]) -> None:
+def compute_initial_liveness(
+    function: Function,
+    loop_forest: Dict[str, LoopNode],
+    loop_edges: Set[Tuple[str, str]],
+) -> None:
     """
     Phase 1: Compute initial liveness sets using postorder traversal of FL(G).
 
@@ -287,7 +302,9 @@ def compute_initial_liveness(function: Function, loop_forest: Dict[str, LoopNode
                 succ_block.live_in = successor_live_ins[successor]
 
 
-def propagate_loop_liveness(function: Function, loop_forest: Dict[str, LoopNode]) -> None:
+def propagate_loop_liveness(
+    function: Function, loop_forest: Dict[str, LoopNode]
+) -> None:
     """
     Phase 2: Propagate liveness within loop bodies using Algorithm 3.
 
@@ -295,20 +312,37 @@ def propagate_loop_liveness(function: Function, loop_forest: Dict[str, LoopNode]
         function: The Function object
         loop_forest: Loop forest structure
     """
+
     def loop_tree_dfs(node: LoopNode) -> None:
         """Recursive DFS traversal of the loop forest (Algorithm 3)."""
         if node.is_loop:
-            block_n = function.blocks[node.block_name]
-            # LiveLoop = LiveIn(BN) \ PhiDefs(BN)
-            live_loop = block_n.live_in - block_n.phi_defs
+            # Collect all live variables in this loop
+            loop_live_vars = set()
 
-            # Visit children
+            # Add live vars from the loop header
+            block_n = function.blocks[node.block_name]
+            loop_live_vars.update(block_n.live_in)
+            loop_live_vars.update(block_n.live_out)
+
+            # Add live vars from all children (recursive)
+            def collect_live_vars(n: LoopNode) -> None:
+                block = function.blocks[n.block_name]
+                loop_live_vars.update(block.live_in)
+                loop_live_vars.update(block.live_out)
+                for child in n.children:
+                    collect_live_vars(child)
+
+            for child in node.children:
+                collect_live_vars(child)
+
+            # Propagate all loop live vars to the header and children
+            block_n.live_in.update(loop_live_vars)
+            block_n.live_out.update(loop_live_vars)
+
             for child in node.children:
                 block_m = function.blocks[child.block_name]
-                # LiveIn(BM) = LiveIn(BM) ∪ LiveLoop
-                block_m.live_in.update(live_loop)
-                # LiveOut(BM) = LiveOut(BM) ∪ LiveLoop
-                block_m.live_out.update(live_loop)
+                block_m.live_in.update(loop_live_vars)
+                block_m.live_out.update(loop_live_vars)
 
                 # Recursively process child
                 loop_tree_dfs(child)
@@ -347,16 +381,20 @@ def check_liveness_correctness(function: Function) -> bool:
             for successor in block.successors:
                 if successor in function.blocks:
                     succ_block = function.blocks[successor]
-                    successor_live_ins.append(f"{successor}: {sorted(succ_block.live_in)}")
+                    successor_live_ins.append(
+                        f"{successor}: {sorted(succ_block.live_in)}"
+                    )
                     if var in succ_block.live_in:
                         found_in_successor = True
                         break
 
             if not found_in_successor:
-                error_msg = (f"Variable '{var}' in LiveOut of block '{block_name}' "
-                           f"not found in LiveIn of any successor.\n"
-                           f"  LiveOut({block_name}): {sorted(block.live_out)}\n"
-                           f"  Successors LiveIn: {successor_live_ins}")
+                error_msg = (
+                    f"Variable '{var}' in LiveOut of block '{block_name}' "
+                    f"not found in LiveIn of any successor.\n"
+                    f"  LiveOut({block_name}): {sorted(block.live_out)}\n"
+                    f"  Successors LiveIn: {successor_live_ins}"
+                )
                 errors.append(error_msg)
 
     if errors:
@@ -366,7 +404,9 @@ def check_liveness_correctness(function: Function) -> bool:
     return True
 
 
-def compute_next_use_distances(function: Function) -> Dict[Tuple[str, int], List[float]]:
+def compute_next_use_distances(
+    function: Function,
+) -> Dict[Tuple[str, int], List[float]]:
     """
     Compute next-use distances for all variable definitions in linear IR.
 
@@ -410,10 +450,9 @@ def compute_next_use_distances(function: Function) -> Dict[Tuple[str, int], List
 
                 # If no uses found, add infinity
                 if not distances[key]:
-                    distances[key].append(float('inf'))
+                    distances[key].append(float("inf"))
 
     return distances
-
 
 
 def compute_block_next_use_distances(function: Function) -> None:
@@ -431,59 +470,35 @@ def compute_block_next_use_distances(function: Function) -> None:
     # Get postorder traversal of blocks
     postorder = postorder_traversal_reduced_cfg(function, loop_edges)
 
-    # Store original live sets (they are sets computed by liveness analysis)
-    original_live_ins = {}
-    original_live_outs = {}
-    for block_name, block in function.blocks.items():
-        original_live_ins[block_name] = block.live_in.copy()
-        original_live_outs[block_name] = block.live_out.copy()
-
-    # Process blocks in postorder
+    print("exit_edges", exit_edges)
+    print("postorder", postorder)
     for block_name in postorder:
-        block = function.blocks[block_name]
+        # Compute live_out as the merged live_in from all successors, taking minimums
+        live_out = {}
+        for succ in function.blocks[block_name].successors:
+            if succ in function.blocks:
+                succ_live_in = function.blocks[succ].live_in
+                for var, val in succ_live_in.items():
+                    if var not in live_out:
+                        live_out[var] = val
+                    else:
+                        live_out[var] = min(live_out[var], val)
+        function.blocks[block_name].live_out = live_out
 
-        # Convert live_out set to distance map
-        live_out_dict = {}
-        for var in original_live_outs[block_name]:
-            min_dist = float('inf')
-            for successor in block.successors:
-                assert( successor in function.blocks)
-                succ_block = function.blocks[successor]
-                # Check if var is used directly in successor
-                if isinstance(succ_block.live_in, dict) and var in succ_block.live_in:
-                    normal_dist = succ_block.live_in[var]
-                    # If this is an exit edge, add 10**9 to the distance
-                    if (block_name, successor) in exit_edges:
-                        normal_dist += 10**9
-                    min_dist = min(min_dist, normal_dist)
-            live_out_dict[var] = min_dist
-        block.live_out = live_out_dict
-
-        # Convert live_in set to distance map by processing instructions in reverse
-        next_use = {}  # var -> instruction position where first used
-
-        # Process instructions in reverse order (from last to first)
-        for i in range(len(block.instructions) - 1, -1, -1):
-            instr = block.instructions[i]
-
-            # Record uses at this instruction position
+        i = len(function.blocks[block_name].instructions)
+        for instr in reversed(function.blocks[block_name].instructions):
             if isinstance(instr, Op):
-                for var in instr.uses:
-                    if var not in next_use:  # Only record first use
-                        next_use[var] = i
-
-
-        # Set live_in distances for variables that are live into the block
-        live_in_dict = {}
-        for var in original_live_ins[block_name]:
-            if var in next_use:
-                live_in_dict[var] = next_use[var]  # distance from block start
-            elif isinstance(block.live_out, dict) and var in block.live_out:
-                # Variable not used in this block but live out, so distance is len(block) + live_out distance
-                live_in_dict[var] = len(block.instructions) + block.live_out[var]
-            else:
-                live_in_dict[var] = float('inf')
-        block.live_in = live_in_dict
+                for use in instr.uses:
+                    if use in function.blocks[block_name].live_in:
+                        function.blocks[block_name].live_in[use] = min(
+                            function.blocks[block_name].live_in[use], i
+                        )
+                i -= 1
+        for var, dist in function.blocks[block_name].live_in.items():
+            if dist >= len(function.blocks[block_name].instructions) and var in function.blocks[block_name].live_out:
+                function.blocks[block_name].live_in[var] = function.blocks[
+                    block_name
+                ].live_out[var] + len(function.blocks[block_name].instructions)
 
 
 def compute_liveness(function: Function) -> None:
@@ -504,6 +519,14 @@ def compute_liveness(function: Function) -> None:
 
     # Phase 2: Loop propagation
     propagate_loop_liveness(function, loop_forest)
+
+    for block_name in function.blocks:
+        function.blocks[block_name].live_in = {
+            var: float("inf") for var in function.blocks[block_name].live_in
+        }
+        function.blocks[block_name].live_out = {
+            var: float("inf") for var in function.blocks[block_name].live_out
+        }
 
     # Phase 3: Compute next-use distances
     compute_block_next_use_distances(function)

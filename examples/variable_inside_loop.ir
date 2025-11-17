@@ -1,0 +1,17 @@
+# Basic IR
+function condbr3
+
+block b0:
+  jmp header
+
+
+
+block header:
+  op defs=%v0
+  jmp body,b3
+
+block body:
+  op uses=%v0
+  jmp header
+
+block b3:

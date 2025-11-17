@@ -1,0 +1,17 @@
+# Basic IR
+function condbr3
+
+block b0:
+  op defs=%v0
+  jmp b2
+
+
+
+block b2:
+  jmp b1,b3
+
+block b1:
+  jmp b2
+
+block b3:
+  op uses=%v0

@@ -256,8 +256,6 @@ def test_parser(ir_file: str) -> None:
         print(f"Parse error: {e}")
     except FileNotFoundError:
         print(f"{ir_file} not found")
-    except Exception as e:
-        print(f"Unexpected error: {e}")
 
 
 def main():
