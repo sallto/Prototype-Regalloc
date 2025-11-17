@@ -1,17 +1,16 @@
-function simple
+function if
 
 block b0:
   op defs=%v0
   op defs=%v1
   op defs=%v2
   op uses=%v0
-  jmp b1
+  jmp b1,b2
 block b1:
   op defs=%v3
   op uses=%v0
   jmp b2
 block b2:
-  op defs=%v4
   op uses=%v0
   jmp b3
 block b3:
