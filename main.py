@@ -200,7 +200,23 @@ def print_function(function: Function) -> None:
             if isinstance(instr, Op):
                 uses_str = ", ".join(instr.uses) if instr.uses else "none"
                 defs_str = ", ".join(instr.defs) if instr.defs else "none"
-                print(f"      {i} (val_local_idx={instr.val_local_idx}): op uses=[{uses_str}] defs=[{defs_str}]")
+
+                # Show next-use distances for definitions
+                distances_info = ""
+                if instr.defs:
+                    distance_parts = []
+                    for var in instr.defs:
+                        key = (var, instr.val_local_idx)
+                        distances = function.next_use_distances.get(key, [float('inf')])
+                        if distances == [float('inf')]:
+                            dist_str = "[inf]"
+                        else:
+                            dist_str = f"[{', '.join(str(int(d)) for d in distances)}]"
+                        distance_parts.append(f"{var}: {dist_str}")
+                    if distance_parts:
+                        distances_info = f" | next-use: {', '.join(distance_parts)}"
+
+                print(f"      {i} (val_local_idx={instr.val_local_idx}): op uses=[{uses_str}] defs=[{defs_str}]{distances_info}")
             elif isinstance(instr, Jump):
                 targets_str = ", ".join(instr.targets)
                 print(f"      {i} (val_local_idx={instr.val_local_idx}): jmp {targets_str}")
@@ -232,6 +248,11 @@ def test_parser(ir_file: str) -> None:
         print("Computing liveness analysis...")
         liveness.compute_liveness(function)
         print("Liveness analysis completed!")
+
+        # Compute next-use distances
+        print("Computing next-use distances...")
+        function.next_use_distances = liveness.compute_next_use_distances(function)
+        print("Next-use distance calculation completed!")
 
         # Check liveness correctness
         print("Checking liveness correctness...")

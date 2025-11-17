@@ -347,6 +347,72 @@ def check_liveness_correctness(function: Function) -> bool:
     return True
 
 
+def compute_next_use_distances(function: Function) -> Dict[Tuple[str, int], List[float]]:
+    """
+    Compute next-use distances for all variable definitions in linear IR.
+
+    For each variable definition, calculates the instruction distances to all subsequent uses.
+    Distance is infinity if there are no further uses.
+
+    Args:
+        function: The Function object with instructions
+
+    Returns:
+        Dict mapping (variable_name, definition_instruction_index) -> list of distances
+    """
+    distances = {}
+
+    # For linear IR without control flow, process blocks in order
+    # Assume blocks are processed in the order they appear (b0, b1, etc.)
+    block_names = sorted(function.blocks.keys())
+
+    # Collect all instructions in global order
+    all_instructions = []
+    for block_name in block_names:
+        block = function.blocks[block_name]
+        for instr in block.instructions:
+            all_instructions.append((instr, block_name))
+
+    # For each instruction that defines variables
+    for def_idx, (instr, def_block) in enumerate(all_instructions):
+        if isinstance(instr, Op) and instr.defs:
+            for var in instr.defs:
+                key = (var, instr.val_local_idx)
+                distances[key] = []
+
+                # Scan forward for uses of this variable
+                for use_idx in range(def_idx + 1, len(all_instructions)):
+                    use_instr, use_block = all_instructions[use_idx]
+
+                    if isinstance(use_instr, Op) and var in use_instr.uses:
+                        # Found a use - calculate distance
+                        distance = use_instr.val_local_idx - instr.val_local_idx
+                        distances[key].append(distance)
+
+                # If no uses found, add infinity
+                if not distances[key]:
+                    distances[key].append(float('inf'))
+
+    return distances
+
+
+def get_next_use_distance(function: Function, variable: str, definition_idx: int) -> List[float]:
+    """
+    Get next-use distances for a specific variable definition.
+
+    Args:
+        function: The Function object
+        variable: Variable name (e.g., "%v0")
+        definition_idx: Instruction index where variable was defined
+
+    Returns:
+        List of distances to subsequent uses, or [float('inf')] if no uses
+    """
+    distances = compute_next_use_distances(function)
+    key = (variable, definition_idx)
+    return distances.get(key, [float('inf')])
+
+
 def compute_liveness(function: Function) -> None:
     """
     Main function that orchestrates the two-phase liveness analysis.

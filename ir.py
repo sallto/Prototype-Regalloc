@@ -3,7 +3,7 @@ IR Classes for Simple SSA-like Intermediate Representation
 """
 
 from dataclasses import dataclass
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Tuple
 
 
 @dataclass
@@ -89,10 +89,12 @@ class Block:
 class Function:
     name: str
     blocks: Dict[str, Block]
+    next_use_distances: Dict[Tuple[str, int], List[float]] = None
 
     def __init__(self, name: str):
         self.name = name
         self.blocks = {}
+        self.next_use_distances = {}
 
     def add_block(self, block: Block) -> None:
         self.blocks[block.name] = block
