@@ -415,22 +415,6 @@ def compute_next_use_distances(function: Function) -> Dict[Tuple[str, int], List
     return distances
 
 
-def get_next_use_distance(function: Function, variable: str, definition_idx: int) -> List[float]:
-    """
-    Get next-use distances for a specific variable definition.
-
-    Args:
-        function: The Function object
-        variable: Variable name (e.g., "%v0")
-        definition_idx: Instruction index where variable was defined
-
-    Returns:
-        List of distances to subsequent uses, or [float('inf')] if no uses
-    """
-    distances = compute_next_use_distances(function)
-    key = (variable, definition_idx)
-    return distances.get(key, [float('inf')])
-
 
 def compute_block_next_use_distances(function: Function) -> None:
     """
@@ -488,10 +472,6 @@ def compute_block_next_use_distances(function: Function) -> None:
                     if var not in next_use:  # Only record first use
                         next_use[var] = i
 
-                # Kill definitions (remove from tracking since they're redefined)
-                for var in instr.defs:
-                    if var in next_use:
-                        del next_use[var]
 
         # Set live_in distances for variables that are live into the block
         live_in_dict = {}
