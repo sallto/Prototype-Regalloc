@@ -543,7 +543,7 @@ def compute_block_next_use_distances(function: Function) -> None:
     # Build loop forest and identify loop edges (needed for postorder traversal)
     loop_forest, loop_edges, loop_membership = build_loop_forest(function)
     exit_edges = compute_loop_exit_edges(loop_membership, function)
-
+    print("loop_edges", loop_edges)
     # Get postorder traversal of blocks
     postorder = postorder_traversal_reduced_cfg(function, loop_edges)
 
@@ -556,6 +556,8 @@ def compute_block_next_use_distances(function: Function) -> None:
             if succ in function.blocks:
                 succ_live_in = function.blocks[succ].live_in
                 for var, val in succ_live_in.items():
+                    if (block_name, succ) in exit_edges:
+                        val += 10**9
                     if var not in live_out:
                         live_out[var] = val
                     else:
@@ -572,7 +574,10 @@ def compute_block_next_use_distances(function: Function) -> None:
                         )
             i -= 1
         for var, dist in function.blocks[block_name].live_in.items():
-            if dist >= len(function.blocks[block_name].instructions) and var in function.blocks[block_name].live_out:
+            if (
+                dist >= len(function.blocks[block_name].instructions)
+                and var in function.blocks[block_name].live_out
+            ):
                 function.blocks[block_name].live_in[var] = function.blocks[
                     block_name
                 ].live_out[var] + len(function.blocks[block_name].instructions)
