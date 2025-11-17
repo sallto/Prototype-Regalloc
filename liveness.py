@@ -8,7 +8,7 @@ The algorithm has two phases:
 1. Postorder traversal of FL(G) (CFG without loop edges)
 2. Loop-nesting forest traversal to propagate liveness within loops
 """
-
+# todo: non reducible control flow
 from typing import List, Dict, Set, Tuple
 from dataclasses import dataclass
 from ir import Function, Block, Op, Phi
@@ -23,53 +23,48 @@ class LoopNode:
     parent: 'LoopNode' = None
 
 
-def compute_predecessors(function: Function) -> None:
+def compute_predecessors_and_use_def_sets(function: Function) -> None:
     """
-    Build predecessor lists for each block from successor information.
+    Build predecessor lists and compute USE, DEF, PhiUses, and PhiDefs sets for each block.
+    USE set only includes variables used before they are defined in the block.
 
     Args:
         function: The Function object with blocks
     """
-    # Clear existing predecessors
-    for block in function.blocks.values():
-        block.predecessors = []
-
-    # Build predecessors from successors
+    # Single pass over all blocks
     for block_name, block in function.blocks.items():
-        for successor in block.successors:
-            if successor in function.blocks:
-                function.blocks[successor].predecessors.append(block_name)
-            else:
-                raise ValueError(f"Block '{block_name}' has successor '{successor}' that doesn't exist")
-
-
-def compute_use_def_sets(function: Function) -> None:
-    """
-    Compute USE, DEF, PhiUses, and PhiDefs sets for each block.
-
-    Args:
-        function: The Function object with blocks
-    """
-    from main import Op, Phi
-
-    for block in function.blocks.values():
-        # Clear existing sets
+        # Compute USE/DEF sets (order-aware)
         block.use_set = set()
         block.def_set = set()
         block.phi_uses = set()
         block.phi_defs = set()
 
+        # Track variables that have been defined so far in this block
+        defined_so_far = set()
+
         for instr in block.instructions:
             if isinstance(instr, Op):
-                # Add uses and defs from Op instructions
-                block.use_set.update(instr.uses)
+                # Add uses that haven't been defined yet in this block
+                for use in instr.uses:
+                    if use not in defined_so_far:
+                        block.use_set.add(use)
+                # Add defs
                 block.def_set.update(instr.defs)
+                defined_so_far.update(instr.defs)
             elif isinstance(instr, Phi):
                 # Add phi destination to phi_defs
                 block.phi_defs.add(instr.dest)
+                defined_so_far.add(instr.dest)
                 # Add all incoming values to phi_uses
                 for incoming in instr.incomings:
-                    block.phi_uses.add(incoming.value)
+                    function.blocks[incoming.block].phi_uses.add(incoming.value)
+
+        # Build predecessors from successors
+        for successor in block.successors:
+            if successor in function.blocks:
+                function.blocks[successor].predecessors.append(block_name)
+            else:
+                raise ValueError(f"Block '{block_name}' has successor '{successor}' that doesn't exist")
 
 
 def build_loop_forest(function: Function) -> Tuple[Dict[str, LoopNode], Set[Tuple[str, str]]]:
@@ -184,44 +179,32 @@ def build_loop_forest(function: Function) -> Tuple[Dict[str, LoopNode], Set[Tupl
     return loop_forest, back_edges
 
 
-def get_reduced_cfg_edges(function: Function, loop_edges: Set[Tuple[str, str]]) -> List[Tuple[str, str]]:
+def postorder_traversal_reduced_cfg(function: Function, loop_edges: Set[Tuple[str, str]]) -> List[str]:
     """
-    Get edges of the reduced CFG FL(G) by removing loop edges.
+    Perform postorder traversal of the reduced CFG FL(G) by building adjacency list on-the-fly
+    while filtering out loop edges.
 
     Args:
         function: The Function object
         loop_edges: Set of (source, target) tuples that are loop edges
 
     Returns:
-        List of (source, target) tuples representing edges in FL(G)
+        List of block names in postorder traversal of FL(G)
     """
-    edges = []
+    # Build adjacency list on-the-fly while filtering loop edges
+    adj = {}
+    all_blocks = set(function.blocks.keys())
+
+    for block in all_blocks:
+        adj[block] = []
+
     for block_name, block in function.blocks.items():
         for successor in block.successors:
             edge = (block_name, successor)
             if edge not in loop_edges:
-                edges.append(edge)
-    return edges
+                adj[block_name].append(successor)
 
-
-def postorder_traversal(edges: List[Tuple[str, str]], all_blocks: Set[str]) -> List[str]:
-    """
-    Perform postorder traversal of the graph defined by edges.
-
-    Args:
-        edges: List of (source, target) tuples
-        all_blocks: Set of all block names
-
-    Returns:
-        List of block names in postorder
-    """
-    # Build adjacency list
-    adj = {}
-    for block in all_blocks:
-        adj[block] = []
-    for src, tgt in edges:
-        adj[src].append(tgt)
-
+    # Perform postorder traversal
     visited = set()
     postorder = []
 
@@ -250,12 +233,8 @@ def compute_initial_liveness(function: Function, loop_forest: Dict[str, LoopNode
         loop_forest: Loop forest structure
         loop_edges: Set of loop edges to exclude
     """
-    # Get reduced CFG edges (without loop edges)
-    reduced_edges = get_reduced_cfg_edges(function, loop_edges)
-    all_blocks = set(function.blocks.keys())
-
-    # Perform postorder traversal
-    postorder = postorder_traversal(reduced_edges, all_blocks)
+    # Perform postorder traversal of reduced CFG (FL(G))
+    postorder = postorder_traversal_reduced_cfg(function, loop_edges)
 
     # Initialize live sets (already done in Block.__init__)
 
@@ -263,27 +242,34 @@ def compute_initial_liveness(function: Function, loop_forest: Dict[str, LoopNode
     for block_name in postorder:
         block = function.blocks[block_name]
 
-        # LiveOut(B) = union of LiveIn(S) for all successors S
+        # Remove PhiDefs(S) from LiveIn(S) for each successor S before computing LiveOut
+        successor_live_ins = {}
+        for successor in block.successors:
+            if successor in function.blocks:
+                succ_block = function.blocks[successor]
+                # Store original LiveIn for successors
+                successor_live_ins[successor] = succ_block.live_in.copy()
+                # Remove phi definitions from LiveIn for propagation
+                succ_block.live_in -= succ_block.phi_defs
+
+        # LiveOut(B) = union of LiveIn(S) for all successors S (with phi defs removed)
         block.live_out = set()
         for successor in block.successors:
             if successor in function.blocks:
                 succ_block = function.blocks[successor]
                 block.live_out.update(succ_block.live_in)
 
-        # Add PhiUses(B) to LiveOut(B)
-        block.live_out.update(block.phi_uses)
-
-        # Remove PhiDefs(S) from LiveIn(S) for each successor S
-        for successor in block.successors:
-            if successor in function.blocks:
-                succ_block = function.blocks[successor]
-                succ_block.live_in -= succ_block.phi_defs
-
         # LiveIn(B) = (LiveOut(B) - DEF(B)) ∪ USE(B)
         block.live_in = (block.live_out - block.def_set) | block.use_set
 
         # Add PhiDefs(B) to LiveIn(B)
         block.live_in.update(block.phi_defs)
+
+        # Restore original LiveIn for successors (add back phi defs)
+        for successor in block.successors:
+            if successor in function.blocks:
+                succ_block = function.blocks[successor]
+                succ_block.live_in = successor_live_ins[successor]
 
 
 def propagate_loop_liveness(function: Function, loop_forest: Dict[str, LoopNode]) -> None:
@@ -318,6 +304,49 @@ def propagate_loop_liveness(function: Function, loop_forest: Dict[str, LoopNode]
         loop_tree_dfs(root)
 
 
+def check_liveness_correctness(function: Function) -> bool:
+    """
+    Check correctness of liveness analysis by verifying that every variable in LiveOut(B)
+    appears in LiveIn(S) for at least one successor S of B.
+
+    Args:
+        function: The Function object to check
+
+    Returns:
+        bool: True if liveness is correct, False otherwise
+
+    Raises:
+        AssertionError: If liveness correctness check fails with details
+    """
+    errors = []
+
+    for block_name, block in function.blocks.items():
+        for var in block.live_out:
+            found_in_successor = False
+            successor_live_ins = []
+
+            for successor in block.successors:
+                if successor in function.blocks:
+                    succ_block = function.blocks[successor]
+                    successor_live_ins.append(f"{successor}: {sorted(succ_block.live_in)}")
+                    if var in succ_block.live_in:
+                        found_in_successor = True
+                        break
+
+            if not found_in_successor:
+                error_msg = (f"Variable '{var}' in LiveOut of block '{block_name}' "
+                           f"not found in LiveIn of any successor.\n"
+                           f"  LiveOut({block_name}): {sorted(block.live_out)}\n"
+                           f"  Successors LiveIn: {successor_live_ins}")
+                errors.append(error_msg)
+
+    if errors:
+        error_details = "\n\n".join(errors)
+        raise AssertionError(f"Liveness correctness check failed:\n\n{error_details}")
+
+    return True
+
+
 def compute_liveness(function: Function) -> None:
     """
     Main function that orchestrates the two-phase liveness analysis.
@@ -326,8 +355,7 @@ def compute_liveness(function: Function) -> None:
         function: The Function object to analyze
     """
     # Phase 0: Setup
-    compute_predecessors(function)
-    compute_use_def_sets(function)
+    compute_predecessors_and_use_def_sets(function)
 
     # Build loop forest and identify loop edges
     loop_forest, loop_edges = build_loop_forest(function)

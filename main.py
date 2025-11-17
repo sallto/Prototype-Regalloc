@@ -17,6 +17,8 @@ Grammar:
 
 from ir import *
 import liveness
+import argparse
+import sys
 
 
 
@@ -208,17 +210,20 @@ def print_function(function: Function) -> None:
         print()
 
 
-def test_parser() -> None:
-    """Test the parser with the example from README.md."""
+def test_parser(ir_file: str) -> None:
+    """Test the parser with IR from the specified file."""
     try:
-        with open("README.md", "r") as f:
+        with open(ir_file, "r") as f:
             content = f.read()
 
-        # Find the IR content (everything after the first line)
+        # Skip the first line if it starts with a comment or if it's README.md
         lines = content.splitlines()
-        ir_text = "\n".join(lines[1:])  # Skip the "# Basic IR" header
+        if lines and (lines[0].startswith("#") or ir_file.endswith("README.md")):
+            ir_text = "\n".join(lines[1:])  # Skip the header line
+        else:
+            ir_text = content
 
-        print("Parsing README.md IR...")
+        print(f"Parsing {ir_file} IR...")
         function = parse_function(ir_text)
         print("Parse successful!")
         print()
@@ -227,6 +232,15 @@ def test_parser() -> None:
         print("Computing liveness analysis...")
         liveness.compute_liveness(function)
         print("Liveness analysis completed!")
+
+        # Check liveness correctness
+        print("Checking liveness correctness...")
+        try:
+            liveness.check_liveness_correctness(function)
+            print("Liveness correctness check passed!")
+        except AssertionError as e:
+            print(f"Liveness correctness check failed: {e}")
+            return
         print()
 
         print_function(function)
@@ -234,30 +248,17 @@ def test_parser() -> None:
     except ParseError as e:
         print(f"Parse error: {e}")
     except FileNotFoundError:
-        print("README.md not found")
+        print(f"{ir_file} not found")
     except Exception as e:
         print(f"Unexpected error: {e}")
 
 
 def main():
-    test_parser()
+    parser = argparse.ArgumentParser(description="IR Parser and Liveness Analysis")
+    parser.add_argument("file", help="Path to the IR file to parse")
+    args = parser.parse_args()
 
-    # Now run liveness and allocation
-    try:
-        with open("README.md", "r") as f:
-            content = f.read()
-
-        lines = content.splitlines()
-        ir_text = "\n".join(lines[1:])
-
-        function = parse_function(ir_text)
-
-        # Compute liveness
-        liveness.compute_liveness(function)
-        print_function(function)
-
-    except Exception as e:
-        print(f"Error in analysis: {e}")
+    test_parser(args.file)
 
 
 if __name__ == "__main__":

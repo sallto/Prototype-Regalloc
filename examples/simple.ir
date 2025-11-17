@@ -1,0 +1,7 @@
+function simple
+
+block b0:
+  op defs=%v0
+  op defs=%v1
+  op defs=%v2
+  op uses=%v0
