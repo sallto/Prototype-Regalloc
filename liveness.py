@@ -353,6 +353,83 @@ def propagate_loop_liveness(
         loop_tree_dfs(root)
 
 
+def propagate_next_use_distances(
+    function: Function, loop_forest: Dict[str, LoopNode]
+) -> None:
+    """
+    Propagate next-use distances within loop bodies to handle loop back edges.
+
+    Similar to propagate_loop_liveness but works with distance dictionaries,
+    taking minimum distances when merging.
+
+    Args:
+        function: The Function object
+        loop_forest: Loop forest structure
+    """
+
+    def loop_tree_dfs(node: LoopNode) -> None:
+        """Recursive DFS traversal of the loop forest."""
+        if node.is_loop:
+            # Collect all next-use distances in this loop
+            loop_distances = {}
+
+            # Add distances from the loop header
+            block_n = function.blocks[node.block_name]
+            for var, dist in block_n.live_in.items():
+                if var not in loop_distances:
+                    loop_distances[var] = dist
+                else:
+                    loop_distances[var] = min(loop_distances[var], dist)
+
+            for var, dist in block_n.live_out.items():
+                if var not in loop_distances:
+                    loop_distances[var] = dist
+                else:
+                    loop_distances[var] = min(loop_distances[var], dist)
+
+            # Add distances from all children (recursive)
+            def collect_distances(n: LoopNode) -> None:
+                block = function.blocks[n.block_name]
+                for var, dist in block.live_in.items():
+                    if var not in loop_distances:
+                        loop_distances[var] = dist
+                    else:
+                        loop_distances[var] = min(loop_distances[var], dist)
+
+                for var, dist in block.live_out.items():
+                    if var not in loop_distances:
+                        loop_distances[var] = dist
+                    else:
+                        loop_distances[var] = min(loop_distances[var], dist)
+
+                for child in n.children:
+                    collect_distances(child)
+
+            for child in node.children:
+                collect_distances(child)
+
+            # Propagate minimum distances to the header and children
+            # Update header
+            for var, min_dist in loop_distances.items():
+                block_n.live_in[var] = min_dist
+                block_n.live_out[var] = min_dist
+
+            # Update children
+            for child in node.children:
+                block_m = function.blocks[child.block_name]
+                for var, min_dist in loop_distances.items():
+                    block_m.live_in[var] = min_dist
+                    block_m.live_out[var] = min_dist
+
+                # Recursively process child
+                loop_tree_dfs(child)
+
+    # Start from root nodes (nodes with no parent)
+    roots = [node for node in loop_forest.values() if node.parent is None]
+    for root in roots:
+        loop_tree_dfs(root)
+
+
 def check_liveness_correctness(function: Function) -> bool:
     """
     Check correctness of liveness analysis by verifying that every variable in LiveOut(B)
@@ -493,7 +570,7 @@ def compute_block_next_use_distances(function: Function) -> None:
                         function.blocks[block_name].live_in[use] = min(
                             function.blocks[block_name].live_in[use], i
                         )
-                i -= 1
+            i -= 1
         for var, dist in function.blocks[block_name].live_in.items():
             if dist >= len(function.blocks[block_name].instructions) and var in function.blocks[block_name].live_out:
                 function.blocks[block_name].live_in[var] = function.blocks[
@@ -530,3 +607,6 @@ def compute_liveness(function: Function) -> None:
 
     # Phase 3: Compute next-use distances
     compute_block_next_use_distances(function)
+
+    # Phase 4: Propagate next-use distances within loops
+    propagate_next_use_distances(function, loop_forest)
