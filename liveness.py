@@ -67,7 +67,7 @@ def compute_predecessors_and_use_def_sets(function: Function) -> None:
                 raise ValueError(f"Block '{block_name}' has successor '{successor}' that doesn't exist")
 
 
-def build_loop_forest(function: Function) -> Tuple[Dict[str, LoopNode], Set[Tuple[str, str]]]:
+def build_loop_forest(function: Function) -> Tuple[Dict[str, LoopNode], Set[Tuple[str, str]], Dict[str, Set[str]]]:
     """
     Build loop-nesting forest for reducible graphs and identify loop edges.
 
@@ -75,9 +75,10 @@ def build_loop_forest(function: Function) -> Tuple[Dict[str, LoopNode], Set[Tupl
         function: The Function object with blocks
 
     Returns:
-        Tuple of (loop_forest_dict, loop_edges_set)
+        Tuple of (loop_forest_dict, loop_edges_set, loop_membership_dict)
         - loop_forest_dict: Maps block names to their LoopNode in the forest
         - loop_edges_set: Set of (source, target) tuples that are loop edges
+        - loop_membership_dict: Maps loop headers to sets of blocks in each loop
     """
     # This is a simplified implementation for reducible graphs
     # A full implementation would use Tarjan's algorithm or similar
@@ -91,30 +92,25 @@ def build_loop_forest(function: Function) -> Tuple[Dict[str, LoopNode], Set[Tupl
     back_edges = set()
     loop_forest = {}
 
-    def dfs(block_name: str, path: Set[str]):
+    def dfs(block_name: str, predecessor: str = None):
         """DFS traversal to find loops and build forest structure."""
         if block_name in visiting:
             # Found a back edge - this indicates a loop
             loop_headers.add(block_name)
-            # The back edge is from current path to block_name
-            # Find the source of the back edge
-            for path_block in path:
-                if function.blocks[path_block].successors.__contains__(block_name):
-                    back_edges.add((path_block, block_name))
-                    break
+            # The back edge is from predecessor to block_name
+            if predecessor is not None:
+                back_edges.add((predecessor, block_name))
             return
 
         if block_name in visited:
             return
 
         visiting.add(block_name)
-        path.add(block_name)
 
         for successor in function.blocks[block_name].successors:
-            dfs(successor, path)
+            dfs(successor, block_name)
 
         visiting.remove(block_name)
-        path.remove(block_name)
         visited.add(block_name)
 
         # Create LoopNode for this block
@@ -135,48 +131,67 @@ def build_loop_forest(function: Function) -> Tuple[Dict[str, LoopNode], Set[Tupl
     # Start DFS from each root candidate
     for root in root_candidates:
         if root not in visited:
-            dfs(root, set())
+            dfs(root)
 
     # Build parent-child relationships in the forest
     # For this simplified version, we'll create a basic tree structure
     # A full implementation would need proper loop nesting analysis
 
-    # For now, create a simple forest where loop headers are parents of their loop bodies
-    processed = set()
-    loop_edges = set()
+    # Compute loop membership
+    loop_membership = {}
+    for loop_header in [node.block_name for node in loop_forest.values() if node.is_loop]:
+        loop_blocks = {loop_header}
+        # Add all sources of back edges to this header
+        for src, tgt in back_edges:
+            if tgt == loop_header:
+                loop_blocks.add(src)
+        loop_membership[loop_header] = loop_blocks
 
-    def build_forest_hierarchy():
-        """Build the hierarchical structure of the loop forest."""
-        # This is a simplified hierarchy - real implementation needs proper nesting
-        for block_name, node in loop_forest.items():
-            if node.is_loop:
-                # Find blocks that are in this loop
-                # Simplified: any block that has a path to this header via back edges
-                loop_blocks = set()
-                for src, tgt in back_edges:
-                    if tgt == block_name:
-                        # Find all blocks dominated by this loop header
-                        # Simplified: just add the source block
-                        loop_blocks.add(src)
+    # Build hierarchy based on loop membership
+    for loop_header, loop_blocks in loop_membership.items():
+        for block in loop_blocks:
+            if block != loop_header and block in loop_forest:
+                loop_forest[loop_header].children.append(loop_forest[block])
+                loop_forest[block].parent = loop_forest[loop_header]
 
-                for loop_block in loop_blocks:
-                    if loop_block in loop_forest and loop_block != block_name:
-                        loop_forest[block_name].children.append(loop_forest[loop_block])
-                        loop_forest[loop_block].parent = loop_forest[block_name]
+    return loop_forest, back_edges, loop_membership
 
-        # Add regular blocks as children of non-loop blocks
-        for block_name, node in loop_forest.items():
-            if not node.is_loop and not node.parent:
-                # Find a parent - simplified: attach to first predecessor that's a loop header
-                for pred in function.blocks[block_name].predecessors:
-                    if pred in loop_forest and loop_forest[pred].is_loop:
-                        loop_forest[pred].children.append(node)
-                        node.parent = loop_forest[pred]
-                        break
 
-    build_forest_hierarchy()
+def compute_loop_exit_edges(loop_membership: Dict[str, Set[str]], function: Function) -> Set[Tuple[str, str]]:
+    """
+    Identify loop exit edges.
 
-    return loop_forest, back_edges
+    An exit edge is an edge (src, dst) where src is in a loop but dst is not in the same loop.
+
+    Args:
+        loop_membership: Dictionary mapping loop headers to sets of blocks in each loop
+        function: The Function object
+
+    Returns:
+        Set of (source, target) tuples representing exit edges
+    """
+    exit_edges = set()
+
+    # Create reverse mapping: block -> set of loops it belongs to
+    block_to_loops = {}
+    for loop_header, loop_blocks in loop_membership.items():
+        for block in loop_blocks:
+            if block not in block_to_loops:
+                block_to_loops[block] = set()
+            block_to_loops[block].add(loop_header)
+
+    # Check each edge in the CFG
+    for src_block_name, src_block in function.blocks.items():
+        for dst_block_name in src_block.successors:
+            # Check if src is in any loop
+            src_loops = block_to_loops.get(src_block_name, set())
+            dst_loops = block_to_loops.get(dst_block_name, set())
+
+        # If src is in a loop but dst is not in any of the same loops, it's an exit edge
+        if src_loops and not dst_loops.intersection(src_loops):
+            exit_edges.add((src_block_name, dst_block_name))
+
+    return exit_edges
 
 
 def postorder_traversal_reduced_cfg(function: Function, loop_edges: Set[Tuple[str, str]]) -> List[str]:
@@ -321,6 +336,10 @@ def check_liveness_correctness(function: Function) -> bool:
     errors = []
 
     for block_name, block in function.blocks.items():
+        # Skip terminal blocks (blocks with no successors) as they don't need to propagate liveness
+        if not block.successors:
+            continue
+
         for var in block.live_out:
             found_in_successor = False
             successor_live_ins = []
@@ -422,7 +441,8 @@ def compute_block_next_use_distances(function: Function) -> None:
         function: The Function object to analyze
     """
     # Build loop forest and identify loop edges (needed for postorder traversal)
-    loop_forest, loop_edges = build_loop_forest(function)
+    loop_forest, loop_edges, loop_membership = build_loop_forest(function)
+    exit_edges = compute_loop_exit_edges(loop_membership, function)
 
     # Get postorder traversal of blocks
     postorder = postorder_traversal_reduced_cfg(function, loop_edges)
@@ -447,7 +467,11 @@ def compute_block_next_use_distances(function: Function) -> None:
                 succ_block = function.blocks[successor]
                 # Check if var is used directly in successor
                 if isinstance(succ_block.live_in, dict) and var in succ_block.live_in:
-                    min_dist = min(min_dist, succ_block.live_in[var])
+                    normal_dist = succ_block.live_in[var]
+                    # If this is an exit edge, add 10**9 to the distance
+                    if (block_name, successor) in exit_edges:
+                        normal_dist += 10**9
+                    min_dist = min(min_dist, normal_dist)
             live_out_dict[var] = min_dist
         block.live_out = live_out_dict
 
@@ -493,7 +517,7 @@ def compute_liveness(function: Function) -> None:
     compute_predecessors_and_use_def_sets(function)
 
     # Build loop forest and identify loop edges
-    loop_forest, loop_edges = build_loop_forest(function)
+    loop_forest, loop_edges, loop_membership = build_loop_forest(function)
 
     # Phase 1: Initial liveness computation
     compute_initial_liveness(function, loop_forest, loop_edges)
