@@ -15,87 +15,9 @@ Grammar:
 - Identifiers: % followed by letters, numbers, underscores (e.g., %v0, %result_1)
 """
 
-from dataclasses import dataclass
-from typing import List, Dict, Set
+from ir import *
+import liveness
 
-
-@dataclass
-class ParseError(Exception):
-    message: str
-    line: int
-    column: int = 0
-
-    def __str__(self) -> str:
-        return f"ParseError at line {self.line}, column {self.column}: {self.message}"
-
-
-@dataclass
-class Instruction:
-    kind: str  # "op", "jmp", or "phi"
-    val_local_idx: int
-
-
-@dataclass
-class Op(Instruction):
-    uses: List[str]
-    defs: List[str]
-
-    def __init__(self, val_local_idx: int, uses: List[str] = [], defs: List[str] = []):
-        super().__init__(kind="op", val_local_idx=val_local_idx)
-        self.uses = uses
-        self.defs = defs
-
-
-@dataclass
-class Jump(Instruction):
-    targets: List[str]
-
-    def __init__(self, val_local_idx: int, targets: List[str]):
-        super().__init__(kind="jmp", val_local_idx=val_local_idx)
-        self.targets = targets
-
-
-@dataclass
-class PhiIncoming:
-    block: str
-    value: str
-
-
-@dataclass
-class Phi(Instruction):
-    dest: str
-    incomings: List[PhiIncoming]
-
-    def __init__(self, val_local_idx: int, dest: str, incomings: List[PhiIncoming]):
-        super().__init__(kind="phi", val_local_idx=val_local_idx)
-        self.dest = dest
-        self.incomings = incomings
-
-
-
-@dataclass
-class Block:
-    name: str
-    instructions: List[Instruction]
-    successors: List[str]
-
-    def __init__(self, name: str):
-        self.name = name
-        self.instructions = []
-        self.successors = []
-
-
-@dataclass
-class Function:
-    name: str
-    blocks: Dict[str, Block]
-
-    def __init__(self, name: str):
-        self.name = name
-        self.blocks = {}
-
-    def add_block(self, block: Block) -> None:
-        self.blocks[block.name] = block
 
 
 def parse_function(text: str) -> Function:
@@ -263,7 +185,14 @@ def print_function(function: Function) -> None:
     print("Blocks:")
     for block_name, block in function.blocks.items():
         print(f"  {block_name}:")
+        print(f"    Predecessors: {block.predecessors}")
         print(f"    Successors: {block.successors}")
+        print(f"    USE set: {sorted(block.use_set) if block.use_set else 'empty'}")
+        print(f"    DEF set: {sorted(block.def_set) if block.def_set else 'empty'}")
+        print(f"    PhiUses: {sorted(block.phi_uses) if block.phi_uses else 'empty'}")
+        print(f"    PhiDefs: {sorted(block.phi_defs) if block.phi_defs else 'empty'}")
+        print(f"    LiveIn: {sorted(block.live_in) if block.live_in else 'empty'}")
+        print(f"    LiveOut: {sorted(block.live_out) if block.live_out else 'empty'}")
         print("    Instructions:")
         for i, instr in enumerate(block.instructions):
             if isinstance(instr, Op):
@@ -293,6 +222,13 @@ def test_parser() -> None:
         function = parse_function(ir_text)
         print("Parse successful!")
         print()
+
+        # Compute liveness
+        print("Computing liveness analysis...")
+        liveness.compute_liveness(function)
+        print("Liveness analysis completed!")
+        print()
+
         print_function(function)
 
     except ParseError as e:
@@ -315,6 +251,10 @@ def main():
         ir_text = "\n".join(lines[1:])
 
         function = parse_function(ir_text)
+
+        # Compute liveness
+        liveness.compute_liveness(function)
+        print_function(function)
 
     except Exception as e:
         print(f"Error in analysis: {e}")
