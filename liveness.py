@@ -273,33 +273,16 @@ def compute_initial_liveness(
         block = function.blocks[block_name]
 
         # Remove PhiDefs(S) from LiveIn(S) for each successor S before computing LiveOut
-        successor_live_ins = {}
+        live = block.phi_uses.copy()
         for successor in block.successors:
-            if successor in function.blocks:
-                succ_block = function.blocks[successor]
-                # Store original LiveIn for successors
-                successor_live_ins[successor] = succ_block.live_in.copy()
-                # Remove phi definitions from LiveIn for propagation
-                succ_block.live_in -= succ_block.phi_defs
-
-        # LiveOut(B) = union of LiveIn(S) for all successors S (with phi defs removed)
-        block.live_out = set()
-        for successor in block.successors:
-            if successor in function.blocks:
-                succ_block = function.blocks[successor]
-                block.live_out.update(succ_block.live_in)
+            live |= function.blocks[successor].live_in - function.blocks[successor].phi_defs
+        block.live_out = live
 
         # LiveIn(B) = (LiveOut(B) - DEF(B)) ∪ USE(B)
         block.live_in = (block.live_out - block.def_set) | block.use_set
 
         # Add PhiDefs(B) to LiveIn(B)
         block.live_in.update(block.phi_defs)
-
-        # Restore original LiveIn for successors (add back phi defs)
-        for successor in block.successors:
-            if successor in function.blocks:
-                succ_block = function.blocks[successor]
-                succ_block.live_in = successor_live_ins[successor]
 
 
 def propagate_loop_liveness(
@@ -562,6 +545,7 @@ def compute_block_next_use_distances(function: Function) -> None:
                         live_out[var] = val
                     else:
                         live_out[var] = min(live_out[var], val)
+                    
         function.blocks[block_name].live_out = live_out
 
         i = len(function.blocks[block_name].instructions)
@@ -601,6 +585,7 @@ def compute_liveness(function: Function) -> None:
 
     # Phase 2: Loop propagation
     propagate_loop_liveness(function, loop_forest)
+
 
     for block_name in function.blocks:
         function.blocks[block_name].live_in = {
