@@ -59,6 +59,25 @@ class Phi(Instruction):
         self.incomings = incomings
 
 
+def val_is_phi(function: Function, value: str) -> bool:
+    """Returns True if the value is defined by a phi instruction."""
+    for block in function.blocks.values():
+        if value in block.phi_defs:
+            return True
+    return False
+
+
+def val_as_phi(function: Function, value: str) -> Union[Phi, None]:
+    """Returns the Phi instruction that defines the given value, or None if not found."""
+    for block in function.blocks.values():
+        if value in block.phi_defs:
+            # Find the phi instruction that defines this value
+            for instr in block.instructions:
+                if isinstance(instr, Phi) and instr.dest == value:
+                    return instr
+    return None
+
+
 @dataclass
 class Block:
     name: str

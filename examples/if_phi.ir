@@ -1,0 +1,10 @@
+function if:
+block b0:
+  op defs=%v0
+  jmp b1,b2
+block b1:
+  op defs=%v1
+  jmp b2
+block b2:
+  phi %v3 [b0, %v0, b1, %v1]
+  op uses=%v3

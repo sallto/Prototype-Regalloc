@@ -10,10 +10,9 @@ The algorithm has two phases:
 """
 
 # todo: non reducible control flow
-from collections import defaultdict
 from typing import List, Dict, Set, Tuple
 from dataclasses import dataclass
-from ir import Function, Block, Op, Phi
+from ir import Function, Op, Phi, val_as_phi
 
 
 @dataclass
@@ -447,6 +446,17 @@ def check_liveness_correctness(function: Function) -> bool:
                     if var in succ_block.live_in:
                         found_in_successor = True
                         break
+                    # Also check if var flows into a phi in this successor from this block
+                    for instr in succ_block.instructions:
+                        if isinstance(instr, Phi):
+                            for incoming in instr.incomings:
+                                if incoming.block == block_name and incoming.value == var:
+                                    found_in_successor = True
+                                    break
+                            if found_in_successor:
+                                break
+                    if found_in_successor:
+                        break
 
             if not found_in_successor:
                 error_msg = (
@@ -533,19 +543,41 @@ def compute_block_next_use_distances(function: Function) -> None:
     print("exit_edges", exit_edges)
     print("postorder", postorder)
     for block_name in postorder:
+        block = function.blocks[block_name]
         # Compute live_out as the merged live_in from all successors, taking minimums
+        # Start with phi_uses (values flowing into phis from this block)
         live_out = {}
-        for succ in function.blocks[block_name].successors:
+        block_len = len(block.instructions)
+        
+        for succ in block.successors:
             if succ in function.blocks:
-                succ_live_in = function.blocks[succ].live_in
+                succ_block = function.blocks[succ]
+                succ_live_in = succ_block.live_in
                 for var, val in succ_live_in.items():
                     if (block_name, succ) in exit_edges:
                         val += 10**9
-                    if var not in live_out:
-                        live_out[var] = val
+                    # Exclude phi destinations from successor's live_in
+                    if var in succ_block.phi_defs:
+                        # For phi destinations, find the incoming value from this block
+                        phi_instr = val_as_phi(function, var)
+                        if phi_instr:
+                            for incoming in phi_instr.incomings:
+                                if incoming.block == block_name:
+                                    # Include the incoming value instead
+                                    incoming_val = incoming.value
+                                    adjusted_val = val
+                                    if incoming_val not in live_out:
+                                        live_out[incoming_val] = adjusted_val
+                                    else:
+                                        live_out[incoming_val] = min(live_out[incoming_val], adjusted_val)
+                        # Don't include the phi destination itself
                     else:
-                        live_out[var] = min(live_out[var], val)
-                    
+                        # Include non-phi variables normally
+                        if var not in live_out:
+                            live_out[var] = val
+                        else:
+                            live_out[var] = min(live_out[var], val)
+
         function.blocks[block_name].live_out = live_out
 
         i = len(function.blocks[block_name].instructions)
