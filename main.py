@@ -193,8 +193,12 @@ def print_function(function: Function) -> None:
         print(f"    DEF set: {sorted(block.def_set) if block.def_set else 'empty'}")
         print(f"    PhiUses: {sorted(block.phi_uses) if block.phi_uses else 'empty'}")
         print(f"    PhiDefs: {sorted(block.phi_defs) if block.phi_defs else 'empty'}")
-        print(f"    LiveIn: {sorted(block.live_in) if block.live_in else 'empty'}")
-        print(f"    LiveOut: {sorted(block.live_out) if block.live_out else 'empty'}")
+        live_in_str = ', '.join(f"{var}:{dist:.0f}" if dist != float('inf') else f"{var}:inf"
+                               for var, dist in sorted(block.live_in.items())) if isinstance(block.live_in, dict) and block.live_in else 'empty'
+        live_out_str = ', '.join(f"{var}:{dist:.0f}" if dist != float('inf') else f"{var}:inf"
+                                for var, dist in sorted(block.live_out.items())) if isinstance(block.live_out, dict) and block.live_out else 'empty'
+        print(f"    LiveIn: {{{live_in_str}}}")
+        print(f"    LiveOut: {{{live_out_str}}}")
         print("    Instructions:")
         for i, instr in enumerate(block.instructions):
             if isinstance(instr, Op):

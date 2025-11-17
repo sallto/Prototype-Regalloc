@@ -413,6 +413,98 @@ def get_next_use_distance(function: Function, variable: str, definition_idx: int
     return distances.get(key, [float('inf')])
 
 
+def find_first_use_in_block(function: Function, var: str, block_name: str) -> float:
+    """
+    Find the instruction position of the first use of a variable in a block.
+
+    Args:
+        function: The Function object
+        var: Variable name to search for
+        block_name: Block to search in
+
+    Returns:
+        Instruction position (0-indexed) or float('inf') if not found
+    """
+    block = function.blocks[block_name]
+    for i, instr in enumerate(block.instructions):
+        if isinstance(instr, Op) and var in instr.uses:
+            return i
+    return float('inf')
+
+
+def compute_block_next_use_distances(function: Function) -> None:
+    """
+    Compute next-use distances for live_in and live_out sets by processing
+    blocks in post-order and instructions in reverse within each block.
+
+    Args:
+        function: The Function object to analyze
+    """
+    # Build loop forest and identify loop edges (needed for postorder traversal)
+    loop_forest, loop_edges = build_loop_forest(function)
+
+    # Get postorder traversal of blocks
+    postorder = postorder_traversal_reduced_cfg(function, loop_edges)
+
+    # Store original live sets (they are sets computed by liveness analysis)
+    original_live_ins = {}
+    original_live_outs = {}
+    for block_name, block in function.blocks.items():
+        original_live_ins[block_name] = block.live_in.copy()
+        original_live_outs[block_name] = block.live_out.copy()
+
+    # Process blocks in postorder
+    for block_name in postorder:
+        block = function.blocks[block_name]
+
+        # Convert live_out set to distance map
+        live_out_dict = {}
+        for var in original_live_outs[block_name]:
+            min_dist = float('inf')
+            for successor in block.successors:
+                if successor in function.blocks:
+                    succ_block = function.blocks[successor]
+                    # Check if var is used directly in successor
+                    direct_use = find_first_use_in_block(function, var, successor)
+                    if direct_use != float('inf'):
+                        min_dist = min(min_dist, direct_use)
+                    # Check if var is in successor's live_in (simplified calculation)
+                    elif isinstance(succ_block.live_in, dict) and var in succ_block.live_in:
+                        min_dist = min(min_dist, succ_block.live_in[var])
+            live_out_dict[var] = min_dist
+        block.live_out = live_out_dict
+
+        # Convert live_in set to distance map by processing instructions in reverse
+        next_use = {}  # var -> instruction position where first used
+
+        # Process instructions in reverse order (from last to first)
+        for i in range(len(block.instructions) - 1, -1, -1):
+            instr = block.instructions[i]
+
+            # Record uses at this instruction position
+            if isinstance(instr, Op):
+                for var in instr.uses:
+                    if var not in next_use:  # Only record first use
+                        next_use[var] = i
+
+                # Kill definitions (remove from tracking since they're redefined)
+                for var in instr.defs:
+                    if var in next_use:
+                        del next_use[var]
+
+        # Set live_in distances for variables that are live into the block
+        live_in_dict = {}
+        for var in original_live_ins[block_name]:
+            if var in next_use:
+                live_in_dict[var] = next_use[var]  # distance from block start
+            elif isinstance(block.live_out, dict) and var in block.live_out:
+                # Variable not used in this block but live out, so distance is len(block) + live_out distance
+                live_in_dict[var] = len(block.instructions) + block.live_out[var]
+            else:
+                live_in_dict[var] = float('inf')
+        block.live_in = live_in_dict
+
+
 def compute_liveness(function: Function) -> None:
     """
     Main function that orchestrates the two-phase liveness analysis.
@@ -431,3 +523,6 @@ def compute_liveness(function: Function) -> None:
 
     # Phase 2: Loop propagation
     propagate_loop_liveness(function, loop_forest)
+
+    # Phase 3: Compute next-use distances
+    compute_block_next_use_distances(function)

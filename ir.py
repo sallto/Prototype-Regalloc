@@ -65,8 +65,8 @@ class Block:
     instructions: List[Instruction]
     successors: List[str]
     predecessors: List[str]
-    live_in: Set[str]
-    live_out: Set[str]
+    live_in: Dict[str, float]
+    live_out: Dict[str, float]
     use_set: Set[str]
     def_set: Set[str]
     phi_uses: Set[str]
@@ -77,8 +77,8 @@ class Block:
         self.instructions = []
         self.successors = []
         self.predecessors = []
-        self.live_in = set()
-        self.live_out = set()
+        self.live_in = {}
+        self.live_out = {}
         self.use_set = set()
         self.def_set = set()
         self.phi_uses = set()

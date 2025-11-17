@@ -1,0 +1,14 @@
+function simple
+
+block b0:
+  op defs=%v0
+  op defs=%v1
+  op defs=%v2
+  op uses=%v0
+  jmp b1
+block b1:
+  op defs=%v3
+  op uses=%v0
+  jmp b2
+block b2:
+  op uses=%v1
