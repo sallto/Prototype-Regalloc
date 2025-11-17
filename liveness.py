@@ -413,25 +413,6 @@ def get_next_use_distance(function: Function, variable: str, definition_idx: int
     return distances.get(key, [float('inf')])
 
 
-def find_first_use_in_block(function: Function, var: str, block_name: str) -> float:
-    """
-    Find the instruction position of the first use of a variable in a block.
-
-    Args:
-        function: The Function object
-        var: Variable name to search for
-        block_name: Block to search in
-
-    Returns:
-        Instruction position (0-indexed) or float('inf') if not found
-    """
-    block = function.blocks[block_name]
-    for i, instr in enumerate(block.instructions):
-        if isinstance(instr, Op) and var in instr.uses:
-            return i
-    return float('inf')
-
-
 def compute_block_next_use_distances(function: Function) -> None:
     """
     Compute next-use distances for live_in and live_out sets by processing
@@ -462,15 +443,11 @@ def compute_block_next_use_distances(function: Function) -> None:
         for var in original_live_outs[block_name]:
             min_dist = float('inf')
             for successor in block.successors:
-                if successor in function.blocks:
-                    succ_block = function.blocks[successor]
-                    # Check if var is used directly in successor
-                    direct_use = find_first_use_in_block(function, var, successor)
-                    if direct_use != float('inf'):
-                        min_dist = min(min_dist, direct_use)
-                    # Check if var is in successor's live_in (simplified calculation)
-                    elif isinstance(succ_block.live_in, dict) and var in succ_block.live_in:
-                        min_dist = min(min_dist, succ_block.live_in[var])
+                assert( successor in function.blocks)
+                succ_block = function.blocks[successor]
+                # Check if var is used directly in successor
+                if isinstance(succ_block.live_in, dict) and var in succ_block.live_in:
+                    min_dist = min(min_dist, succ_block.live_in[var])
             live_out_dict[var] = min_dist
         block.live_out = live_out_dict
 
