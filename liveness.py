@@ -33,13 +33,15 @@ def compute_predecessors_and_use_def_sets(function: Function) -> None:
     Args:
         function: The Function object with blocks
     """
-    # Single pass over all blocks
-    for block_name, block in function.blocks.items():
-        # Compute USE/DEF sets (order-aware)
+    # Initialize sets for all blocks
+    for block in function.blocks.values():
         block.use_set = set()
         block.def_set = set()
         block.phi_uses = set()
         block.phi_defs = set()
+
+    # Single pass over all blocks
+    for block_name, block in function.blocks.items():
 
         # Track variables that have been defined so far in this block
         defined_so_far = set()
@@ -336,80 +338,121 @@ def propagate_loop_liveness(
 
 
 def propagate_next_use_distances(
-    function: Function, loop_forest: Dict[str, LoopNode]
+    function: Function,
+    loop_forest: Dict[str, LoopNode],
+    loop_membership: Dict[str, Set[str]],
 ) -> None:
     """
     Propagate next-use distances within loop bodies to handle loop back edges.
 
     Similar to propagate_loop_liveness but works with distance dictionaries,
-    taking minimum distances when merging.
+    and performs a fixpoint computation over loop blocks so loop-carried
+    distances account for back edges.
 
     Args:
         function: The Function object
         loop_forest: Loop forest structure
+        loop_membership: Mapping of loop headers to their member blocks
     """
 
-    def loop_tree_dfs(node: LoopNode) -> None:
-        """Recursive DFS traversal of the loop forest."""
-        if node.is_loop:
-            # Collect all next-use distances in this loop
-            loop_distances = {}
+    if not loop_membership:
+        return
 
-            # Add distances from the loop header
-            block_n = function.blocks[node.block_name]
-            for var, dist in block_n.live_in.items():
-                if var not in loop_distances:
-                    loop_distances[var] = dist
+    exit_edges = compute_loop_exit_edges(loop_membership, function)
+    processed_headers = set()
+
+    def recompute_block(block_name: str) -> bool:
+        """Recompute distances for a block; return True if any value decreases."""
+        block = function.blocks[block_name]
+        changed = False
+
+        for succ in block.successors:
+            if succ not in function.blocks:
+                continue
+            succ_block = function.blocks[succ]
+            succ_live_in = succ_block.live_in
+
+            for var, val in succ_live_in.items():
+                adjusted_val = val
+                if (block_name, succ) in exit_edges:
+                    adjusted_val += 10**9
+
+                if var in succ_block.phi_defs:
+                    phi_instr = val_as_phi(function, var)
+                    if not phi_instr:
+                        continue
+                    for incoming in phi_instr.incomings:
+                        if incoming.block == block_name:
+                            incoming_val = incoming.value
+                            prev = block.live_out.get(incoming_val, float("inf"))
+                            if adjusted_val < prev:
+                                block.live_out[incoming_val] = adjusted_val
+                                changed = True
                 else:
-                    loop_distances[var] = min(loop_distances[var], dist)
+                    prev = block.live_out.get(var, float("inf"))
+                    if adjusted_val < prev:
+                        block.live_out[var] = adjusted_val
+                        changed = True
 
-            for var, dist in block_n.live_out.items():
-                if var not in loop_distances:
-                    loop_distances[var] = dist
-                else:
-                    loop_distances[var] = min(loop_distances[var], dist)
+        tracked_vars = set(block.live_in.keys()) | set(block.live_out.keys())
+        block_len = len(block.instructions)
+        i = block_len
+        temp_in = {var: float("inf") for var in tracked_vars}
 
-            # Add distances from all children (recursive)
-            def collect_distances(n: LoopNode) -> None:
-                block = function.blocks[n.block_name]
-                for var, dist in block.live_in.items():
-                    if var not in loop_distances:
-                        loop_distances[var] = dist
-                    else:
-                        loop_distances[var] = min(loop_distances[var], dist)
+        for instr in reversed(block.instructions):
+            i -= 1
+            if isinstance(instr, Op):
+                for use in instr.uses:
+                    if use not in temp_in:
+                        temp_in[use] = float("inf")
+                    if i < temp_in[use]:
+                        temp_in[use] = i
+            elif isinstance(instr, Phi):
+                for incoming in instr.incomings:
+                    use = incoming.value
+                    if use not in temp_in:
+                        temp_in[use] = float("inf")
+                    if i < temp_in[use]:
+                        temp_in[use] = i
 
-                for var, dist in block.live_out.items():
-                    if var not in loop_distances:
-                        loop_distances[var] = dist
-                    else:
-                        loop_distances[var] = min(loop_distances[var], dist)
+        for var in list(temp_in.keys()):
+            dist = temp_in[var]
+            if dist >= block_len and var in block.live_out:
+                dist = min(dist, block.live_out[var] + block_len)
+            prev = block.live_in.get(var, float("inf"))
+            if dist < prev:
+                block.live_in[var] = dist
+                changed = True
 
-                for child in n.children:
-                    collect_distances(child)
+        return changed
 
-            for child in node.children:
-                collect_distances(child)
+    def process_loop(node: LoopNode) -> None:
+        for child in node.children:
+            process_loop(child)
 
-            # Propagate minimum distances to the header and children
-            # Update header
-            for var, min_dist in loop_distances.items():
-                block_n.live_in[var] = min_dist
-                block_n.live_out[var] = min_dist
+        if not node.is_loop or node.block_name in processed_headers:
+            return
 
-            # Update children
-            for child in node.children:
-                block_m = function.blocks[child.block_name]
-                for var, min_dist in loop_distances.items():
-                    block_m.live_in[var] = min_dist
-                    block_m.live_out[var] = min_dist
+        loop_blocks = loop_membership.get(node.block_name)
+        if not loop_blocks:
+            return
 
-                # Recursively process child
-                loop_tree_dfs(child)
+        changed = True
+        iteration = 0
+        max_iterations = max(1, len(loop_blocks) * 10)
 
-    # Start from root nodes (nodes with no parent)
+        while changed and iteration < max_iterations:
+            iteration += 1
+            changed = False
+            for block_name in loop_blocks:
+                if block_name in function.blocks and recompute_block(block_name):
+                    changed = True
+
+        processed_headers.add(node.block_name)
+
     roots = [node for node in loop_forest.values() if node.parent is None]
     for root in roots:
-        loop_tree_dfs(root)
+        process_loop(root)
 
 
 def check_liveness_correctness(function: Function) -> bool:
@@ -547,7 +590,6 @@ def compute_block_next_use_distances(function: Function) -> None:
         # Compute live_out as the merged live_in from all successors, taking minimums
         # Start with phi_uses (values flowing into phis from this block)
         live_out = {}
-        block_len = len(block.instructions)
         
         for succ in block.successors:
             if succ in function.blocks:
@@ -580,23 +622,31 @@ def compute_block_next_use_distances(function: Function) -> None:
 
         function.blocks[block_name].live_out = live_out
 
-        i = len(function.blocks[block_name].instructions)
+        block_len = len(function.blocks[block_name].instructions)
+        i = block_len
         for instr in reversed(function.blocks[block_name].instructions):
+            i -= 1
             if isinstance(instr, Op):
                 for use in instr.uses:
                     if use in function.blocks[block_name].live_in:
                         function.blocks[block_name].live_in[use] = min(
                             function.blocks[block_name].live_in[use], i
                         )
-            i -= 1
+            elif isinstance(instr, Phi):
+                for incoming in instr.incomings:
+                    use = incoming.value
+                    if use in function.blocks[block_name].live_in:
+                        function.blocks[block_name].live_in[use] = min(
+                            function.blocks[block_name].live_in[use], i
+                        )
         for var, dist in function.blocks[block_name].live_in.items():
             if (
-                dist >= len(function.blocks[block_name].instructions)
+                dist >= block_len
                 and var in function.blocks[block_name].live_out
             ):
                 function.blocks[block_name].live_in[var] = function.blocks[
                     block_name
-                ].live_out[var] + len(function.blocks[block_name].instructions)
+                ].live_out[var] + block_len
 
 
 def compute_liveness(function: Function) -> None:
@@ -631,4 +681,4 @@ def compute_liveness(function: Function) -> None:
     compute_block_next_use_distances(function)
 
     # Phase 4: Propagate next-use distances within loops
-    propagate_next_use_distances(function, loop_forest)
+    propagate_next_use_distances(function, loop_forest, loop_membership)
