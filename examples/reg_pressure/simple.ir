@@ -1,0 +1,13 @@
+function reg_pressure_simple
+
+block b0:
+  op defs=%v0
+  op defs=%v1
+  op defs=%v2
+  op defs=%v3
+  op defs=%v4
+  op uses=%v0
+  op uses=%v1
+  op uses=%v2
+  op uses=%v3
+  op uses=%v4

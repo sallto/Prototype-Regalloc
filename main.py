@@ -206,8 +206,19 @@ def print_function(function: Function) -> None:
                 uses_str = ", ".join(instr.uses) if instr.uses else "none"
                 defs_str = ", ".join(instr.defs) if instr.defs else "none"
 
-                # Show next-use distances for definitions
-                print(f"      {i} (val_local_idx={instr.val_local_idx}): op uses=[{uses_str}] defs=[{defs_str}]")
+                # Show next-use distances for values in this instruction
+                next_use_str = ""
+                if block.next_use_by_instr and i < len(block.next_use_by_instr):
+                    next_uses = []
+                    for var in sorted(set(instr.uses + instr.defs)):
+                        if var in block.next_use_by_instr[i]:
+                            dist = block.next_use_by_instr[i][var]
+                            dist_str = "inf" if dist == float('inf') else str(int(dist))
+                            next_uses.append(f"{var}:{dist_str}")
+                    if next_uses:
+                        next_use_str = f" next_use={{{', '.join(next_uses)}}}"
+
+                print(f"      {i} (val_local_idx={instr.val_local_idx}): op uses=[{uses_str}] defs=[{defs_str}]{next_use_str}")
             elif isinstance(instr, Jump):
                 targets_str = ", ".join(instr.targets)
                 print(f"      {i} (val_local_idx={instr.val_local_idx}): jmp {targets_str}")

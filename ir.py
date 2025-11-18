@@ -91,6 +91,7 @@ class Block:
     phi_uses: Set[str]
     phi_defs: Set[str]
     max_register_pressure: int = 0
+    next_use_by_instr: List[Dict[str, float]] = None
 
     def __init__(self, name: str):
         self.name = name
@@ -103,6 +104,7 @@ class Block:
         self.def_set = set()
         self.phi_uses = set()
         self.phi_defs = set()
+        self.next_use_by_instr = []
 
 
 @dataclass
