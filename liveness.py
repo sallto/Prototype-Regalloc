@@ -900,7 +900,7 @@ def compute_block_next_use_distances(function: Function) -> None:
             if isinstance(instr, Op):
                 for use in instr.uses:
                     if use not in function.blocks[block_name].live_in:
-                        function.blocks[block_name].live_in[use] = float("inf")
+                        continue
                     function.blocks[block_name].live_in[use] = min(
                         function.blocks[block_name].live_in[use], i
                     )
@@ -908,7 +908,7 @@ def compute_block_next_use_distances(function: Function) -> None:
                 for incoming in instr.incomings:
                     use = incoming.value
                     if use not in function.blocks[block_name].live_in:
-                        function.blocks[block_name].live_in[use] = float("inf")
+                        continue
                     function.blocks[block_name].live_in[use] = min(
                         function.blocks[block_name].live_in[use], i
                     )
