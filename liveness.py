@@ -14,7 +14,7 @@ import heapq
 import math
 from typing import List, Dict, Set, Tuple
 from dataclasses import dataclass
-from ir import Function, Op, Phi, val_as_phi
+from ir import Function, Block, Op, Phi, val_as_phi
 
 
 @dataclass
@@ -630,8 +630,7 @@ def propagate_next_use_distances(
                 for use in instr.uses:
                     if use not in temp_in:
                         temp_in[use] = float("inf")
-                    if i < temp_in[use]:
-                        temp_in[use] = i
+                    temp_in[use] = min(temp_in[use], i)
             elif isinstance(instr, Phi):
                 for incoming in instr.incomings:
                     use = incoming.value
@@ -653,6 +652,9 @@ def propagate_next_use_distances(
             prev = block.live_in.get(var, float("inf"))
             if dist < prev:
                 block.live_in[var] = dist
+
+        # Recompute register pressure for this block
+        block.max_register_pressure = compute_register_pressure(block)
 
     affected_blocks: Set[str] = set()
     for info in loop_infos.values():
@@ -777,6 +779,66 @@ def compute_next_use_distances(
     return distances
 
 
+def compute_register_pressure(block: Block) -> int:
+    """
+    Compute the maximum register pressure for a block by tracking live variables
+    during backward instruction traversal, only counting variables with finite
+    next-use distances.
+
+    Args:
+        block: The block to analyze
+
+    Returns:
+        Maximum number of registers needed at any point in the block
+    """
+    block_len = len(block.instructions)
+    i = block_len
+
+    # Initialize current live set with variables that are live at the end of the block
+    current_live = set()
+    max_pressure = 0
+
+    # Add live_out variables with finite distances to initial live set
+    for var, dist in block.live_out.items():
+        if dist < float('inf'):
+            current_live.add(var)
+
+    for instr in reversed(block.instructions):
+        i -= 1
+
+        # Update register pressure - count variables with finite next-use distances
+        # A variable has finite next-use distance if it's in live_in with finite distance,
+        # or it's in live_out with finite distance (meaning it's used later)
+        pressure = len([v for v in current_live if
+                       block.live_in.get(v, float('inf')) < float('inf') or
+                       block.live_out.get(v, float('inf')) < float('inf')])
+        max_pressure = max(max_pressure, pressure)
+
+        if isinstance(instr, Op):
+            # Remove variables defined by this instruction
+            for def_var in instr.defs:
+                current_live.discard(def_var)
+
+            # Add used variables to current live set if they have finite distance
+            for use in instr.uses:
+                if block.live_in.get(use, float('inf')) < float('inf'):
+                    current_live.add(use)
+        elif isinstance(instr, Phi):
+            # Add used variables to current live set if they have finite distance
+            for incoming in instr.incomings:
+                use = incoming.value
+                if block.live_in.get(use, float('inf')) < float('inf'):
+                    current_live.add(use)
+
+    # Check pressure at the beginning of the block (after all instructions)
+    pressure = len([v for v in current_live if
+                   block.live_in.get(v, float('inf')) < float('inf') or
+                   block.live_out.get(v, float('inf')) < float('inf')])
+    max_pressure = max(max_pressure, pressure)
+
+    return max_pressure
+
+
 def compute_block_next_use_distances(function: Function) -> None:
     """
     Compute next-use distances for live_in and live_out sets by processing
@@ -822,7 +884,7 @@ def compute_block_next_use_distances(function: Function) -> None:
                                     else:
                                         live_out[incoming_val] = min(live_out[incoming_val], adjusted_val)
                         # Don't include the phi destination itself
-                    else:
+                    elif var in block.live_out:
                         # Include non-phi variables normally
                         if var not in live_out:
                             live_out[var] = val
@@ -837,17 +899,20 @@ def compute_block_next_use_distances(function: Function) -> None:
             i -= 1
             if isinstance(instr, Op):
                 for use in instr.uses:
-                    if use in function.blocks[block_name].live_in:
-                        function.blocks[block_name].live_in[use] = min(
-                            function.blocks[block_name].live_in[use], i
-                        )
+                    if use not in function.blocks[block_name].live_in:
+                        function.blocks[block_name].live_in[use] = float("inf")
+                    function.blocks[block_name].live_in[use] = min(
+                        function.blocks[block_name].live_in[use], i
+                    )
             elif isinstance(instr, Phi):
                 for incoming in instr.incomings:
                     use = incoming.value
-                    if use in function.blocks[block_name].live_in:
-                        function.blocks[block_name].live_in[use] = min(
-                            function.blocks[block_name].live_in[use], i
-                        )
+                    if use not in function.blocks[block_name].live_in:
+                        function.blocks[block_name].live_in[use] = float("inf")
+                    function.blocks[block_name].live_in[use] = min(
+                        function.blocks[block_name].live_in[use], i
+                    )
+
         for var, dist in function.blocks[block_name].live_in.items():
             if (
                 dist >= block_len
@@ -856,6 +921,9 @@ def compute_block_next_use_distances(function: Function) -> None:
                 function.blocks[block_name].live_in[var] = function.blocks[
                     block_name
                 ].live_out[var] + block_len
+
+        # Compute register pressure for this block
+        function.blocks[block_name].max_register_pressure = compute_register_pressure(function.blocks[block_name])
 
 
 def compute_liveness(function: Function) -> None:

@@ -193,6 +193,7 @@ def print_function(function: Function) -> None:
         print(f"    DEF set: {sorted(block.def_set) if block.def_set else 'empty'}")
         print(f"    PhiUses: {sorted(block.phi_uses) if block.phi_uses else 'empty'}")
         print(f"    PhiDefs: {sorted(block.phi_defs) if block.phi_defs else 'empty'}")
+        print(f"    Max Register Pressure: {block.max_register_pressure}")
         live_in_str = ', '.join(f"{var}:{dist:.0f}" if dist != float('inf') else f"{var}:inf"
                                for var, dist in sorted(block.live_in.items())) if isinstance(block.live_in, dict) and block.live_in else 'empty'
         live_out_str = ', '.join(f"{var}:{dist:.0f}" if dist != float('inf') else f"{var}:inf"

@@ -90,6 +90,7 @@ class Block:
     def_set: Set[str]
     phi_uses: Set[str]
     phi_defs: Set[str]
+    max_register_pressure: int = 0
 
     def __init__(self, name: str):
         self.name = name
