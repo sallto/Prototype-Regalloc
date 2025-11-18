@@ -366,6 +366,12 @@ def propagate_next_use_distances(
         block = function.blocks[block_name]
         changed = False
 
+        # Find which loop this block belongs to (if any)
+        block_loops = set()
+        for loop_header, loop_blocks in loop_membership.items():
+            if block_name in loop_blocks:
+                block_loops.add(loop_header)
+
         for succ in block.successors:
             if succ not in function.blocks:
                 continue
@@ -410,10 +416,18 @@ def propagate_next_use_distances(
             elif isinstance(instr, Phi):
                 for incoming in instr.incomings:
                     use = incoming.value
-                    if use not in temp_in:
-                        temp_in[use] = float("inf")
-                    if i < temp_in[use]:
-                        temp_in[use] = i
+                    # Only consider incoming values as live if they come from within the same loop
+                    # or if this block is not in a loop
+                    incoming_block_loops = set()
+                    for loop_header, loop_blocks in loop_membership.items():
+                        if incoming.block in loop_blocks:
+                            incoming_block_loops.add(loop_header)
+
+                    if not block_loops or block_loops.intersection(incoming_block_loops):
+                        if use not in temp_in:
+                            temp_in[use] = float("inf")
+                        if i < temp_in[use]:
+                            temp_in[use] = i
 
         for var in list(temp_in.keys()):
             dist = temp_in[var]
