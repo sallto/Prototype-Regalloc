@@ -334,15 +334,16 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             # Reload variables in W_entry \ W_exit_pred on edge pred->block
             reload_vars = W_entry - pred_W_exit
             for var in reload_vars:
-                # Insert reload at the beginning of this block (instruction_idx = 0)
-                result[block_name].append(SpillReload("reload", var, 0, block_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+                # Insert reload before the last instruction in predecessor block
+                pred_block = function.blocks[pred_name]
+                result[pred_name].append(SpillReload("reload", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
             # Spill variables in (S_entry \ S_exit_pred) ∩ W_exit_pred on edge pred->block
             spill_vars = (S_entry - pred_S_exit) & pred_W_exit
             for var in spill_vars:
-                # Insert spill at the end of predecessor block
+                # Insert spill before the last instruction (typically the jump) in predecessor block
                 pred_block = function.blocks[pred_name]
-                result[pred_name].append(SpillReload("spill", var, len(pred_block.instructions), pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+                result[pred_name].append(SpillReload("spill", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
         # Process block instructions starting with W = W_entry, S = S_entry
         W = W_entry.copy()
@@ -417,9 +418,9 @@ def print_function_with_spills(function: Function, spills_reloads: Dict[str, Lis
                 ops_by_idx[idx] = []
             ops_by_idx[idx].append(op)
 
-        # Sort operations at each index: reloads before spills
+        # Sort operations at each index: spills before reloads
         for idx in ops_by_idx:
-            ops_by_idx[idx].sort(key=lambda x: (0 if x.type == "reload" else 1, x.variable))
+            ops_by_idx[idx].sort(key=lambda x: (0 if x.type == "spill" else 1, x.variable))
 
         # Build the instruction sequence with spills/reloads inserted
 
@@ -464,7 +465,7 @@ def test_min_algorithm():
     import main
 
     # Parse the IR file
-    ir_file = "examples/reg_pressure/linear.ir"
+    ir_file = "examples/reg_pressure/merge_use.ir"
     print(f"Testing Min algorithm on {ir_file} with k=3 registers")
     print("=" * 60)
 
@@ -473,7 +474,13 @@ def test_min_algorithm():
         with open(ir_file, "r") as f:
             content = f.read()
 
-        # Parse function
+        # Parse function (skip comments)
+        lines = content.split('\n')
+        # Skip comment lines at the beginning
+        start_idx = 0
+        while start_idx < len(lines) and lines[start_idx].strip().startswith('#'):
+            start_idx += 1
+        content = '\n'.join(lines[start_idx:])
         function = main.parse_function(content)
         print("Parsed function successfully!")
         print()
