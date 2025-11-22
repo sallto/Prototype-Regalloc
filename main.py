@@ -17,6 +17,7 @@ Grammar:
 
 from ir import *
 import liveness
+import min_algorithm
 import argparse
 import sys
 
@@ -228,7 +229,7 @@ def print_function(function: Function) -> None:
         print()
 
 
-def test_parser(ir_file: str) -> None:
+def test_parser(ir_file: str, k: int = 3) -> None:
     """Test the parser with IR from the specified file."""
     try:
         with open(ir_file, "r") as f:
@@ -262,7 +263,16 @@ def test_parser(ir_file: str) -> None:
             return
         print()
 
-        print_function(function)
+        # Run the Min algorithm for register allocation
+        print(f"Running Min algorithm with k={k}...")
+        spills_reloads = min_algorithm.min_algorithm(function, k=k)
+        print("Min algorithm completed!")
+        print()
+
+        # Print the IR with spills and reloads
+        print(f"IR with Spills and Reloads (k={k}):")
+        print("=" * 50)
+        min_algorithm.print_function_with_spills(function, spills_reloads)
 
     except ParseError as e:
         print(f"Parse error: {e}")
@@ -273,9 +283,11 @@ def test_parser(ir_file: str) -> None:
 def main():
     parser = argparse.ArgumentParser(description="IR Parser and Liveness Analysis")
     parser.add_argument("file", help="Path to the IR file to parse")
+    parser.add_argument("-k", "--registers", type=int, default=3,
+                        help="Number of available registers (default: 3)")
     args = parser.parse_args()
 
-    test_parser(args.file)
+    test_parser(args.file, args.registers)
 
 
 if __name__ == "__main__":

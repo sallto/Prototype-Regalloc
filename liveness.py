@@ -1,14 +1,3 @@
-"""
-Liveness Analysis for Strict SSA IR
-
-Implements the non-iterative liveness analysis algorithm from:
-"Non-iterative Data-Flow Analysis for Computing Liveness Sets in Strict SSA"
-
-The algorithm has two phases:
-1. Postorder traversal of FL(G) (CFG without loop edges)
-2. Loop-nesting forest traversal to propagate liveness within loops
-"""
-
 # todo: non reducible control flow
 import heapq
 import math
@@ -373,12 +362,24 @@ def apply_loop_best_entries(
     for info in loop_infos.values():
         if not info.best_entry:
             continue
+        # Collect all variables defined within this loop
+        loop_def_vars = set()
+        for block_name in info.blocks:
+            block = function.blocks.get(block_name)
+            if block:
+                loop_def_vars.update(block.def_set)
+                loop_def_vars.update(block.phi_defs)
+
         for block_name, entry_map in info.best_entry.items():
             block = function.blocks.get(block_name)
             if not block:
                 continue
             block_len = info.block_lengths.get(block_name, 0)
             for var, dist in entry_map.items():
+                # Don't propagate variables that are defined within the loop
+                # to any block within the loop
+                if var in loop_def_vars:
+                    continue
                 if dist < block.live_in.get(var, math.inf):
                     block.live_in[var] = dist
                 if dist >= block_len:
@@ -594,23 +595,27 @@ def propagate_next_use_distances(
             succ_block = function.blocks[succ]
             succ_live_in = succ_block.live_in
 
-            for var, val in succ_live_in.items():
-                adjusted_val = val
-                if (block_name, succ) in exit_edges:
-                    adjusted_val += 10**9
+        for var, val in succ_live_in.items():
+            adjusted_val = val
+            if (block_name, succ) in exit_edges:
+                adjusted_val += 10**9
 
-                if var in succ_block.phi_defs:
-                    phi_instr = val_as_phi(function, var)
-                    if not phi_instr:
-                        continue
-                    for incoming in phi_instr.incomings:
-                        if incoming.block == block_name:
-                            incoming_val = incoming.value
-                            prev = block.live_out.get(incoming_val, float("inf"))
+            if var in succ_block.phi_defs:
+                phi_instr = val_as_phi(function, var)
+                if not phi_instr:
+                    continue
+                for incoming in phi_instr.incomings:
+                    if incoming.block == block_name:
+                        incoming_val = incoming.value
+                        # Only update distance if the variable is already in live_out
+                        if incoming_val in block.live_out:
+                            prev = block.live_out[incoming_val]
                             if adjusted_val < prev:
                                 block.live_out[incoming_val] = adjusted_val
-                else:
-                    prev = block.live_out.get(var, float("inf"))
+            else:
+                # Only update distance if the variable is already in live_out
+                if var in block.live_out:
+                    prev = block.live_out[var]
                     if adjusted_val < prev:
                         block.live_out[var] = adjusted_val
 
@@ -618,6 +623,14 @@ def propagate_next_use_distances(
         block_len = len(block.instructions)
         i = block_len
         temp_in = {var: float("inf") for var in tracked_vars}
+
+        # Collect variables defined in this block
+        defined_vars = set()
+        for instr in block.instructions:
+            if isinstance(instr, Op):
+                defined_vars.update(instr.defs)
+            elif isinstance(instr, Phi):
+                defined_vars.add(instr.dest)
 
         block_loops = set()
         for loop_header, loop_blocks in loop_membership.items():
@@ -628,9 +641,9 @@ def propagate_next_use_distances(
             i -= 1
             if isinstance(instr, Op):
                 for use in instr.uses:
-                    if use not in temp_in:
-                        temp_in[use] = float("inf")
-                    temp_in[use] = min(temp_in[use], i)
+                    # Only update distance if the variable is already in temp_in
+                    if use in temp_in:
+                        temp_in[use] = min(temp_in[use], i)
             elif isinstance(instr, Phi):
                 for incoming in instr.incomings:
                     use = incoming.value
@@ -640,10 +653,9 @@ def propagate_next_use_distances(
                             incoming_block_loops.add(loop_header)
 
                     if not block_loops or block_loops.intersection(incoming_block_loops):
-                        if use not in temp_in:
-                            temp_in[use] = float("inf")
-                        if i < temp_in[use]:
-                            temp_in[use] = i
+                        # Only update distance if the variable is already in temp_in
+                        if use in temp_in:
+                            temp_in[use] = min(temp_in[use], i)
 
         for var in list(temp_in.keys()):
             dist = temp_in[var]
@@ -653,8 +665,6 @@ def propagate_next_use_distances(
             if dist < prev:
                 block.live_in[var] = dist
 
-        # Recompute register pressure for this block
-        block.max_register_pressure = compute_register_pressure(block)
 
     affected_blocks: Set[str] = set()
     for info in loop_infos.values():
@@ -780,9 +790,85 @@ def compute_next_use_distances(
 
 
 def compute_register_pressure(block: Block) -> int:
-    
+    """
+    Compute the maximum register pressure for a block by tracking live variables
+    at each instruction point.
+
+    A variable needs a register if:
+    1. It has a finite next-use distance at that instruction point
+    2. OR it's in live_out (needs to be preserved for successor blocks)
+
+    Args:
+        block: The block to analyze
+
+    Returns:
+        Maximum number of live variables at any point in the block
+    """
+    if not block.instructions:
+        return 0
+
     max_pressure = 0
-    # ignore for now
+
+    # All variables that are live out need registers throughout the block
+    live_out_vars = set()
+    if isinstance(block.live_out, dict):
+        live_out_vars = set(block.live_out.keys())
+
+    # Track variables that are currently live (have registers allocated)
+    live_vars = set()
+
+    # Start with variables from live_in that are live at block entry
+    # (those with finite next-use distance)
+    if isinstance(block.live_in, dict):
+        for var, dist in block.live_in.items():
+            if dist != float('inf'):
+                live_vars.add(var)
+
+    # Add all live_out variables (they need registers throughout)
+    live_vars.update(live_out_vars)
+
+    max_pressure = max(max_pressure, len(live_vars))
+
+    # Process each instruction
+    for i, instr in enumerate(block.instructions):
+        # Count pressure at the start of this instruction
+        max_pressure = max(max_pressure, len(live_vars))
+
+        # Process the instruction
+        if isinstance(instr, Op):
+            # Variables used here may become dead if they have no more finite uses
+            for var in instr.uses:
+                if hasattr(block, 'next_use_by_instr') and block.next_use_by_instr and i < len(block.next_use_by_instr):
+                    next_uses = block.next_use_by_instr[i]
+                    if var in next_uses and next_uses[var] == float('inf') and var not in live_out_vars:
+                        live_vars.discard(var)
+
+            # Variables defined here kill their previous live status (unless live out)
+            for var in instr.defs:
+                if var not in live_out_vars:
+                    live_vars.discard(var)
+
+            # Newly defined variables are live if they have finite next uses or are live out
+            if hasattr(block, 'next_use_by_instr') and block.next_use_by_instr and i < len(block.next_use_by_instr):
+                next_uses = block.next_use_by_instr[i]
+                for var in instr.defs:
+                    if (var in next_uses and next_uses[var] != float('inf')) or var in live_out_vars:
+                        live_vars.add(var)
+
+        elif isinstance(instr, Phi):
+            # Phi destinations are defined here
+            if instr.dest not in live_out_vars:
+                live_vars.discard(instr.dest)
+
+            # Phi destinations are live if they have finite next uses or are live out
+            if hasattr(block, 'next_use_by_instr') and block.next_use_by_instr and i < len(block.next_use_by_instr):
+                next_uses = block.next_use_by_instr[i]
+                if (instr.dest in next_uses and next_uses[instr.dest] != float('inf')) or instr.dest in live_out_vars:
+                    live_vars.add(instr.dest)
+
+        # Count pressure at the end of this instruction
+        max_pressure = max(max_pressure, len(live_vars))
+
     return max_pressure
 
 
@@ -869,8 +955,6 @@ def compute_block_next_use_distances(function: Function) -> None:
                     block_name
                 ].live_out[var] + block_len
 
-        # Compute register pressure for this block
-        function.blocks[block_name].max_register_pressure = compute_register_pressure(function.blocks[block_name])
 
 
 def compute_per_instruction_next_use_distances(function: Function) -> None:
@@ -957,3 +1041,7 @@ def compute_liveness(function: Function) -> None:
 
     # Phase 5: Compute per-instruction next-use distances within each block
     compute_per_instruction_next_use_distances(function)
+
+    # Phase 6: Compute register pressure for all blocks
+    for block in function.blocks.values():
+        block.max_register_pressure = compute_register_pressure(block)

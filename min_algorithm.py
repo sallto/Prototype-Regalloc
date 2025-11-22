@@ -10,12 +10,11 @@ pressure exceeds the available number of registers k.
 """
 
 import math
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Union
 from dataclasses import dataclass
 from ir import Function, Block, Op, Jump, Phi
-from liveness import compute_liveness
+from liveness import compute_liveness, build_loop_forest
 from collections import defaultdict
-from typing import Dict, Set, List
 
 
 @dataclass
@@ -57,19 +56,28 @@ def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills:
     # Get next-use distances for variables in W from this instruction onwards
     next_uses = {}
     for var in W:
-        # Scan forward from insn_idx to find next use of this variable
-        next_use_dist = math.inf
-        for future_idx in range(insn_idx, len(block.instructions)):
-            future_instr = block.instructions[future_idx]
-            if isinstance(future_instr, Op) and var in future_instr.uses:
-                next_use_dist = future_idx - insn_idx
-                break
+        # Check if variable is defined at the current instruction
+        current_instr = block.instructions[insn_idx] if insn_idx < len(block.instructions) else None
+        is_defined_here = (current_instr and isinstance(current_instr, Op) and var in current_instr.defs)
 
-        # If variable is live out and not used in this block, use the live_out distance
-        if next_use_dist == math.inf and hasattr(block, 'live_out') and isinstance(block.live_out, dict) and var in block.live_out:
-            # live_out[var] is the distance from block exit, so add distance to exit
-            distance_to_exit = len(block.instructions) - insn_idx
-            next_use_dist = distance_to_exit + block.live_out[var]
+        if is_defined_here:
+            # Variable is redefined at this instruction, so its current value will be overwritten
+            # Don't spill it before the redefinition
+            next_use_dist = math.inf
+        else:
+            # Scan forward from insn_idx to find next use of this variable
+            next_use_dist = math.inf
+            for future_idx in range(insn_idx, len(block.instructions)):
+                future_instr = block.instructions[future_idx]
+                if isinstance(future_instr, Op) and var in future_instr.uses:
+                    next_use_dist = future_idx - insn_idx
+                    break
+
+            # If variable is live out and not used in this block, use the live_out distance
+            if next_use_dist == math.inf and hasattr(block, 'live_out') and isinstance(block.live_out, dict) and var in block.live_out:
+                # live_out[var] is the distance from block exit, so add distance to exit
+                distance_to_exit = len(block.instructions) - insn_idx
+                next_use_dist = distance_to_exit + block.live_out[var]
 
         next_uses[var] = next_use_dist
 
@@ -88,61 +96,6 @@ def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills:
 
     # Update S: remove evicted variables from the already spilled set
     # (since they're being evicted again, they need to be spilled again)
-    S.difference_update(evicted_vars)
-
-    return kept_vars
-
-
-def limit_last_instruction(W: Set[str], S: Set[str], block: Block, m: int, spills: List[SpillReload]) -> Set[str]:
-    """
-    Handle the limit call for the last instruction in a block using live_out information.
-
-    For the last instruction, next-use distances are determined by live_out:
-    - Variables in live_out have distance = block_len (to reach the block exit)
-    - Variables not in live_out have infinite distance
-
-    Args:
-        W: Set of variables currently in registers
-        S: Set of variables already spilled
-        block: Block containing the instruction
-        m: Maximum number of variables to keep in registers
-        spills: List to append spill operations to
-
-    Returns:
-        New set W with at most m variables
-    """
-    # idea: store next-use distances from the beginning of the block, i.e. next-use + i,
-    # then the current next-use dist is saved-next-use - i.
-    if not W or len(W) <= m:
-        return W
-
-    # Get next-use distances for variables in W at the last instruction
-    next_uses = {}
-    last_idx = len(block.instructions) - 1
-
-    for var in W:
-        # Check if variable is used in remaining instructions (none, since this is last)
-        # If live out, it will be used after the block, so distance = 1
-        if hasattr(block, 'live_out') and isinstance(block.live_out, (set, dict)) and var in block.live_out:
-            next_uses[var] = 1  # Used right after this instruction (block exit)
-        else:
-            next_uses[var] = math.inf
-
-    # Sort W by next-use distance (closest first: smallest distance first)
-    sorted_vars = sorted(W, key=lambda v: next_uses.get(v, math.inf))
-
-    # Keep only the first m variables, evict the rest
-    kept_vars = set(sorted_vars[:m])
-    evicted_vars = sorted_vars[m:]
-
-    # Create spills for evicted variables that haven't been spilled before and have finite next use
-    for var in evicted_vars:
-        next_use_dist = next_uses.get(var, math.inf)
-        if var not in S and next_use_dist != math.inf:
-            # Spill before the last instruction
-            spills.append(SpillReload("spill", var, len(block.instructions) - 1, block.name))
-
-    # Update S: remove evicted variables from the already spilled set
     S.difference_update(evicted_vars)
 
     return kept_vars
@@ -221,6 +174,26 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function:
                 cand.add(var)
         # Variables not in pred_W_exits are ignored (unprocessed predecessors)
 
+    # For phi nodes, ensure incoming values are considered for W_entry
+    # Add phi incoming values that are available from their predecessors
+    phi_vars = set()
+    for instr in block.instructions:
+        if isinstance(instr, Phi):
+            for incoming in instr.incomings:
+                if incoming.block in pred_W_exits and incoming.value in pred_W_exits[incoming.block]:
+                    phi_vars.add(incoming.value)
+
+    # Add phi vars to candidates with frequency equal to number of predecessors they come from
+    # (but actually, for initUsual, we want phi vars that are available)
+    for var in phi_vars:
+        if var not in cand:
+            # Count how many predecessors this phi var is available from
+            available_from = sum(1 for pred in block.predecessors
+                               if pred in pred_W_exits and var in pred_W_exits[pred])
+            if available_from > 0:
+                freq[var] = available_from
+                cand.add(var)
+
     # Variables that appear in all predecessors go to take
     num_preds = len(block.predecessors)
     to_remove = []
@@ -281,6 +254,159 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function:
     return take | selected_cand
 
 
+def loopOf(block_name: str, loop_membership: Dict[str, Set[str]]) -> Union[str, None]:
+    """
+    Find which loop header (if any) contains the given block.
+
+    Args:
+        block_name: Name of the block to check
+        loop_membership: Dictionary mapping loop headers to sets of blocks in each loop
+
+    Returns:
+        Loop header name if block is in a loop, None otherwise
+    """
+    for loop_header, loop_blocks in loop_membership.items():
+        if block_name in loop_blocks:
+            return loop_header
+    return None
+
+
+def usedInLoop(loop_header: str, alive_vars: Set[str], loop_membership: Dict[str, Set[str]],
+                function: Function) -> Set[str]:
+    """
+    Return variables from alive_vars that are used in any block within the loop.
+
+    Args:
+        loop_header: Name of the loop header
+        alive_vars: Set of variables to check
+        loop_membership: Dictionary mapping loop headers to sets of blocks in each loop
+        function: The function containing the blocks
+
+    Returns:
+        Set of variables from alive_vars that are used in the loop
+    """
+    if loop_header not in loop_membership:
+        return set()
+
+    used_vars = set()
+    loop_blocks = loop_membership[loop_header]
+
+    for block_name in loop_blocks:
+        if block_name not in function.blocks:
+            continue
+        block = function.blocks[block_name]
+
+        # Check if any alive variables are used in this block
+        for var in alive_vars:
+            if var in block.use_set or var in block.phi_uses:
+                used_vars.add(var)
+
+    return used_vars
+
+
+def getLoopMaxPressure(loop_header: str, loop_membership: Dict[str, Set[str]],
+                       function: Function) -> int:
+    """
+    Compute maximum register pressure across all blocks in the loop.
+
+    Args:
+        loop_header: Name of the loop header
+        loop_membership: Dictionary mapping loop headers to sets of blocks in each loop
+        function: The function containing the blocks
+
+    Returns:
+        Maximum register pressure across all blocks in the loop, or 0 if no blocks
+    """
+    if loop_header not in loop_membership:
+        return 0
+
+    max_pressure = 0
+    loop_blocks = loop_membership[loop_header]
+
+    for block_name in loop_blocks:
+        if block_name in function.blocks:
+            max_pressure = max(max_pressure, function.blocks[block_name].max_register_pressure)
+
+    return max_pressure
+
+
+def sortByNextUse(vars: Set[str], entry_instr_idx: int, block: Block) -> List[str]:
+    """
+    Sort variables by next-use distance from the entry instruction.
+
+    Args:
+        vars: Set of variables to sort
+        entry_instr_idx: Index of the entry instruction (usually 0)
+        block: Block containing the variables
+
+    Returns:
+        List of variables sorted by next-use distance (closest first)
+    """
+    def get_next_use_dist(var: str) -> float:
+        if hasattr(block, 'live_in') and isinstance(block.live_in, dict) and var in block.live_in:
+            return block.live_in[var]
+        else:
+            return float('inf')
+
+    return sorted(vars, key=get_next_use_dist)
+
+
+def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
+                   function: Function, k: int) -> Set[str]:
+    """
+    Initialize W_entry for a loop header block according to the Min algorithm.
+
+    Args:
+        block: The loop header block to initialize
+        loop_membership: Dictionary mapping loop headers to sets of blocks in each loop
+        function: The function containing the block
+        k: Number of available registers
+
+    Returns:
+        Set of variables that should be in registers at block entry
+    """
+    entry = 0  # Index of the first instruction
+    loop = loopOf(block.name, loop_membership)
+
+    # If block is not in a loop, return empty set
+    if loop is None:
+        return set()
+
+    # alive = block.phis ∪ block.liveIn
+    alive = block.phi_defs | set(block.live_in.keys()) if hasattr(block, 'live_in') and isinstance(block.live_in, dict) else block.phi_defs
+
+    # cand = usedInLoop(loop, alive)
+    cand = usedInLoop(loop, alive, loop_membership, function)
+
+    # liveThrough = alive \ cand
+    liveThrough = alive - cand
+    print(f"liveThrough: {liveThrough}")
+
+    if len(cand) < k:
+        # freeLoop = k − loop.maxPressure + |liveThrough|
+        max_pressure = getLoopMaxPressure(loop, loop_membership, function)
+        print(f"max_pressure: {max_pressure}")
+        freeLoop = k - max_pressure + len(liveThrough)
+
+        # sort(liveThrough, entry)
+        sorted_liveThrough = sortByNextUse(liveThrough, entry, block)
+
+        # add = liveThrough[0:freeLoop]
+        add = set(sorted_liveThrough[:freeLoop])
+    else:
+        # sort(cand, entry)
+        sorted_cand = sortByNextUse(cand, entry, block)
+
+        # cand = cand[0:k]
+        cand = set(sorted_cand[:k])
+
+        # add = ∅
+        add = set()
+
+    # return cand ∪ add
+    return cand | add
+
+
 def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]]:
     """
     Implement the Min algorithm for register allocation with spilling across multiple blocks.
@@ -301,6 +427,9 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
     # Get blocks in topological order
     block_order = topological_order(function)
 
+    # Build loop membership information
+    _, _, loop_membership = build_loop_forest(function)
+
     # Track W_exit and S_exit for each block
     W_exit_map = {}  # block_name -> set of variables in registers at exit
     S_exit_map = {}  # block_name -> set of variables spilled at exit
@@ -315,9 +444,14 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             W_entry = set()
             S_entry = set()
         else:
-            # Compute W_entry from predecessors using initUsual
-            pred_W_exits = {pred: W_exit_map.get(pred, set()) for pred in block.predecessors}
-            W_entry = initUsual(block, pred_W_exits, k, function)
+            # Check if this block is a loop header
+            if block_name in loop_membership:
+                # Use initLoopHeader for loop headers
+                W_entry = initLoopHeader(block, loop_membership, function, k)
+            else:
+                # Use initUsual for non-loop headers
+                pred_W_exits = {pred: W_exit_map.get(pred, set()) for pred in block.predecessors}
+                W_entry = initUsual(block, pred_W_exits, k, function)
 
             # Compute S_entry: variables spilled on some path to this block
             S_entry = set()
@@ -326,16 +460,62 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
                     S_entry.update(S_exit_map[pred])
             S_entry &= W_entry  # Only consider variables that are in W_entry
 
-        # Insert coupling code for each predecessor
+        # Insert coupling code for each predecessor that has already been processed
         for pred_name in block.predecessors:
-            pred_W_exit = W_exit_map.get(pred_name, set())
+            # Only insert coupling code if the predecessor has been processed
+            if pred_name not in W_exit_map:
+                continue
+
+            pred_W_exit = W_exit_map[pred_name]
             pred_S_exit = S_exit_map.get(pred_name, set())
 
-            # Reload variables in W_entry \ W_exit_pred on edge pred->block
-            reload_vars = W_entry - pred_W_exit
-            for var in reload_vars:
+            # For phi nodes, ensure incoming values are available at block boundary
+            # Only reload phi incoming values that come from this specific predecessor
+            phi_incoming_vars = set()
+            for instr in block.instructions:
+                if isinstance(instr, Phi):
+                    for incoming in instr.incomings:
+                        if incoming.block == pred_name:
+                            phi_incoming_vars.add(incoming.value)
+            # Reload variables needed for phi incoming values that aren't in registers
+            phi_reload_vars = phi_incoming_vars - pred_W_exit
+            for var in phi_reload_vars:
                 # Insert reload before the last instruction in predecessor block
                 pred_block = function.blocks[pred_name]
+                result[pred_name].append(SpillReload("reload", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+
+            # Reload variables in (W_entry ∩ vars_available_from_pred) \ W_exit_pred on edge pred->block
+            # (excluding phi destinations and phi incoming values from this predecessor)
+            # Phi incoming values are handled separately above
+
+            # Variables that could potentially be reloaded from this predecessor:
+            # - Variables defined in the predecessor block (available at exit)
+            # - Variables that are live into the predecessor (but these would need to be reloaded even earlier)
+            pred_block = function.blocks[pred_name]
+            vars_available_from_pred = set()
+
+            # Variables defined in predecessor are available at its exit
+            for instr in pred_block.instructions:
+                if isinstance(instr, Op) and instr.defs:
+                    vars_available_from_pred.update(instr.defs)
+                elif isinstance(instr, Phi) and instr.dest:
+                    vars_available_from_pred.add(instr.dest)
+
+            # Variables that are live into the predecessor might also be available
+            # (though they would need to be reloaded in an earlier predecessor)
+            if hasattr(pred_block, 'live_in') and isinstance(pred_block.live_in, dict):
+                vars_available_from_pred.update(pred_block.live_in.keys())
+
+            # Only reload variables that are both in W_entry AND available from this predecessor
+            all_phi_incoming_vars = set()
+            for instr in block.instructions:
+                if isinstance(instr, Phi):
+                    for incoming in instr.incomings:
+                        all_phi_incoming_vars.add(incoming.value)
+
+            reload_vars = (W_entry & vars_available_from_pred - pred_W_exit) - block.phi_defs - all_phi_incoming_vars
+            for var in reload_vars:
+                # Insert reload before the last instruction in predecessor block
                 result[pred_name].append(SpillReload("reload", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
             # Spill variables in (S_entry \ S_exit_pred) ∩ W_exit_pred on edge pred->block
@@ -354,8 +534,13 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             if isinstance(instr, Op):
                 instr_uses = instr.uses
                 instr_defs = instr.defs
+            elif isinstance(instr, Phi):
+                # Phi instructions define their destination but don't use variables directly
+                # (uses come from incoming values, handled at block boundaries)
+                instr_uses = []
+                instr_defs = [instr.dest]
             else:
-                # Jump and Phi instructions don't use or define variables directly
+                # Jump instructions don't use or define variables directly
                 instr_uses = []
                 instr_defs = []
 
@@ -371,12 +556,8 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
 
             # Second limit: make room for results
             # For the last instruction, we need to handle this differently
-            if insn_idx < len(block.instructions) - 1:
-                # Not the last instruction: spills to make room for results should happen before this instruction
-                W = limit(W, S, insn_idx, block, k - len(instr_defs), result[block_name])
-            else:
-                # Last instruction: need to handle using live_out information
-                W = limit_last_instruction(W, S, block, k - len(instr_defs), result[block_name])
+            W = limit(W, S, insn_idx, block, k - len(instr_defs), result[block_name])
+
 
             # Add newly defined variables to W
             W.update(instr_defs)
@@ -385,9 +566,68 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             for var in R:
                 result[block_name].append(SpillReload("reload", var, insn_idx, block_name))
 
+        # Check if we need to spill variables before entering loops with high register pressure
+        for succ_name in block.successors:
+            if succ_name in loop_membership:
+                # This successor is a loop header - check if loop has high register pressure
+                max_pressure = getLoopMaxPressure(succ_name, loop_membership, function)
+                if max_pressure > k:
+                    # Loop has high register pressure - spill variables not used in the loop
+                    succ_block = function.blocks[succ_name]
+                    # Compute the alive variables at loop header entry (same as initLoopHeader)
+                    alive_vars = succ_block.phi_defs | set(succ_block.live_in.keys()) if hasattr(succ_block, 'live_in') and isinstance(succ_block.live_in, dict) else succ_block.phi_defs
+                    used_in_loop = usedInLoop(succ_name, alive_vars, loop_membership, function)
+
+                    # Also consider phi incoming values that flow into used phi destinations
+                    phi_used_vars = set()
+                    for instr in succ_block.instructions:
+                        if isinstance(instr, Phi) and instr.dest in used_in_loop:
+                            for incoming in instr.incomings:
+                                phi_used_vars.add(incoming.value)
+                    used_in_loop.update(phi_used_vars)
+
+                    # Only consider variables that are live out of this block for spilling
+                    live_out_vars = set(block.live_out.keys()) if hasattr(block, 'live_out') and isinstance(block.live_out, dict) else set()
+                    # Variables in W that are live out but not used in the loop should be spilled
+                    vars_to_spill = ((W & live_out_vars) - used_in_loop) - block.phi_defs
+
+                    # Spill these variables at the last instruction (before jump to loop)
+                    last_idx = len(block.instructions) - 1
+                    for var in vars_to_spill:
+                        if var not in S:  # Only spill if not already spilled
+                            result[block_name].append(SpillReload("spill", var, last_idx, block_name))
+                            W.remove(var)
+                            S.add(var)
+
         # Store exit state for this block
         W_exit_map[block_name] = W.copy()
         S_exit_map[block_name] = S.copy()
+
+    # Second pass: handle coupling code for back edges (loop edges) where predecessor was processed after successor
+    for block_name in block_order:
+        block = function.blocks[block_name]
+        block_W_exit = W_exit_map[block_name]
+
+        # For each successor that has phi nodes using values from this block
+        for succ_name in block.successors:
+            if succ_name not in function.blocks:
+                continue
+
+            succ_block = function.blocks[succ_name]
+
+            # Check if this successor has phi nodes that need incoming values from this block
+            phi_incoming_vars = set()
+            for instr in succ_block.instructions:
+                if isinstance(instr, Phi):
+                    for incoming in instr.incomings:
+                        if incoming.block == block_name:
+                            phi_incoming_vars.add(incoming.value)
+
+            # Reload phi incoming values that aren't in registers at this block's exit
+            phi_reload_vars = phi_incoming_vars - block_W_exit
+            for var in phi_reload_vars:
+                # Insert reload at the end of this block (before the jump to successor)
+                result[block_name].append(SpillReload("reload", var, len(block.instructions) - 1, block_name, is_coupling=True, edge_info=f"{block_name}->{succ_name}"))
 
     return result
 
@@ -465,7 +705,7 @@ def test_min_algorithm():
     import main
 
     # Parse the IR file
-    ir_file = "examples/reg_pressure/merge_use.ir"
+    ir_file = "examples/reg_pressure/loop.ir"
     print(f"Testing Min algorithm on {ir_file} with k=3 registers")
     print("=" * 60)
 
