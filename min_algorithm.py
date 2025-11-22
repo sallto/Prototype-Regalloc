@@ -46,14 +46,17 @@ def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills:
     if not W or len(W) <= m:
         return W
 
-    # Get next-use distances for variables in W at this instruction
+    # Get next-use distances for variables in W from this instruction onwards
     next_uses = {}
-    if block.next_use_by_instr and insn_idx < len(block.next_use_by_instr):
-        for var in W:
-            if var in block.next_use_by_instr[insn_idx]:
-                next_uses[var] = block.next_use_by_instr[insn_idx][var]
-            else:
-                next_uses[var] = math.inf
+    for var in W:
+        # Scan forward from insn_idx to find next use of this variable
+        next_use_dist = math.inf
+        for future_idx in range(insn_idx, len(block.instructions)):
+            future_instr = block.instructions[future_idx]
+            if isinstance(future_instr, Op) and var in future_instr.uses:
+                next_use_dist = future_idx - insn_idx
+                break
+        next_uses[var] = next_use_dist
 
     # Sort W by next-use distance (closest first: smallest distance first)
     sorted_vars = sorted(W, key=lambda v: next_uses.get(v, math.inf))
@@ -93,19 +96,21 @@ def limit_last_instruction(W: Set[str], S: Set[str], block: Block, m: int, spill
     Returns:
         New set W with at most m variables
     """
+    # idea: store next-use distances from the beginning of the block, i.e. next-use + i,
+    # then the current next-use dist is saved-next-use - i.
     if not W or len(W) <= m:
         return W
 
-    # Get next-use distances for variables in W using live_out
+    # Get next-use distances for variables in W at the last instruction
     next_uses = {}
-    block_len = len(block.instructions)
+    last_idx = len(block.instructions) - 1
 
     for var in W:
-        if isinstance(block.live_out, dict) and var in block.live_out:
-            # Variable is live out, next use is at block exit
-            next_uses[var] = block.live_out[var] + block_len
+        # Check if variable is used in remaining instructions (none, since this is last)
+        # If live out, it will be used after the block, so distance = 1
+        if hasattr(block, 'live_out') and isinstance(block.live_out, (set, dict)) and var in block.live_out:
+            next_uses[var] = 1  # Used right after this instruction (block exit)
         else:
-            # Variable is not live out, infinite distance
             next_uses[var] = math.inf
 
     # Sort W by next-use distance (closest first: smallest distance first)
@@ -149,6 +154,7 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
         # S: variables already spilled (to avoid duplicate spills)
         W = set()
         S = set()
+        
 
         for insn_idx, instr in enumerate(block.instructions):
             if not isinstance(instr, Op):
@@ -192,7 +198,7 @@ def test_min_algorithm():
     import main
 
     # Parse the IR file
-    ir_file = "examples/reg_pressure/simple.ir"
+    ir_file = "examples/reg_pressure/linear.ir"
     print(f"Testing Min algorithm on {ir_file} with k=3 registers")
     print("=" * 60)
 
