@@ -770,7 +770,11 @@ def compute_next_use_distances(
     for def_idx, (instr, def_block) in enumerate(all_instructions):
         if isinstance(instr, Op) and instr.defs:
             for var in instr.defs:
-                key = (var, instr.val_local_idx)
+                # Get value index from function's value_indices map
+                if var not in function.value_indices:
+                    continue
+                def_val_idx = function.value_indices[var]
+                key = (var, def_val_idx)
                 distances[key] = []
 
                 # Scan forward for uses of this variable
@@ -778,8 +782,11 @@ def compute_next_use_distances(
                     use_instr, use_block = all_instructions[use_idx]
 
                     if isinstance(use_instr, Op) and var in use_instr.uses:
-                        # Found a use - calculate distance
-                        distance = use_instr.val_local_idx - instr.val_local_idx
+                        # Found a use - calculate distance using value indices
+                        # Since we're tracking value indices, distance is based on value index difference
+                        # For now, use instruction index difference as approximation
+                        # (could be refined to use value indices if needed)
+                        distance = use_idx - def_idx
                         distances[key].append(distance)
 
                 # If no uses found, add infinity

@@ -45,7 +45,7 @@ def parse_function(text: str) -> Function:
 
     function = Function(func_name)
     current_block = None
-    global_instr_idx = 0  # Global instruction counter for the function
+    value_idx = 0  # Counter for assigning unique indices to values
     line_no += 1
 
     while line_no < len(lines):
@@ -76,18 +76,25 @@ def parse_function(text: str) -> Function:
                 raise ParseError("Instruction found before any block", line_no)
 
             instr_line = line[2:]  # Remove the two spaces
-            val_local_idx = global_instr_idx
-            global_instr_idx += 1
             if instr_line.startswith("op "):
-                op = parse_op_line(instr_line, line_no, val_local_idx)
+                op = parse_op_line(instr_line, line_no)
                 current_block.instructions.append(op)
+                # Assign indices to newly defined values
+                for def_val in op.defs:
+                    if def_val not in function.value_indices:
+                        function.value_indices[def_val] = value_idx
+                        value_idx += 1
             elif instr_line.startswith("jmp "):
-                jmp = parse_jmp_line(instr_line, line_no, val_local_idx)
+                jmp = parse_jmp_line(instr_line, line_no)
                 current_block.instructions.append(jmp)
                 current_block.successors = jmp.targets  # Set block successors
             elif instr_line.startswith("phi "):
-                phi = parse_phi_line(instr_line, line_no, val_local_idx)
+                phi = parse_phi_line(instr_line, line_no)
                 current_block.instructions.append(phi)
+                # Assign index to phi destination value
+                if phi.dest not in function.value_indices:
+                    function.value_indices[phi.dest] = value_idx
+                    value_idx += 1
             else:
                 raise ParseError(f"Unknown instruction type: '{instr_line}'", line_no)
             continue
@@ -101,7 +108,7 @@ def parse_function(text: str) -> Function:
     return function
 
 
-def parse_op_line(line: str, line_no: int, val_local_idx: int) -> Op:
+def parse_op_line(line: str, line_no: int) -> Op:
     """Parse an op instruction line like 'op uses=%v0 defs=%v1'."""
     parts = line.split()
     if len(parts) < 1 or parts[0] != "op":
@@ -124,10 +131,10 @@ def parse_op_line(line: str, line_no: int, val_local_idx: int) -> Op:
         else:
             raise ParseError(f"Unexpected op parameter: '{part}'", line_no)
 
-    return Op(val_local_idx=val_local_idx, uses=uses, defs=defs)
+    return Op(uses=uses, defs=defs)
 
 
-def parse_jmp_line(line: str, line_no: int, val_local_idx: int) -> Jump:
+def parse_jmp_line(line: str, line_no: int) -> Jump:
     """Parse a jmp instruction line like 'jmp b1,b2'."""
     parts = line.split()
     if len(parts) != 2 or parts[0] != "jmp":
@@ -141,10 +148,10 @@ def parse_jmp_line(line: str, line_no: int, val_local_idx: int) -> Jump:
     if not all(targets):
         raise ParseError("Jump targets cannot be empty", line_no)
 
-    return Jump(val_local_idx=val_local_idx, targets=targets)
+    return Jump(targets=targets)
 
 
-def parse_phi_line(line: str, line_no: int, val_local_idx: int) -> Phi:
+def parse_phi_line(line: str, line_no: int) -> Phi:
     """Parse a phi instruction line like 'phi %v6 [b0, %v1, b1, %v4]'."""
     parts = line.split()
     if len(parts) < 3 or parts[0] != "phi":
@@ -177,7 +184,7 @@ def parse_phi_line(line: str, line_no: int, val_local_idx: int) -> Phi:
             raise ParseError(f"Phi value must start with '%', got '{value}'", line_no)
         incomings.append(PhiIncoming(block=block, value=value))
 
-    return Phi(val_local_idx=val_local_idx, dest=dest, incomings=incomings)
+    return Phi(dest=dest, incomings=incomings)
 
 
 
@@ -219,13 +226,13 @@ def print_function(function: Function) -> None:
                     if next_uses:
                         next_use_str = f" next_use={{{', '.join(next_uses)}}}"
 
-                print(f"      {i} (val_local_idx={instr.val_local_idx}): op uses=[{uses_str}] defs=[{defs_str}]{next_use_str}")
+                print(f"      {i}: op uses=[{uses_str}] defs=[{defs_str}]{next_use_str}")
             elif isinstance(instr, Jump):
                 targets_str = ", ".join(instr.targets)
-                print(f"      {i} (val_local_idx={instr.val_local_idx}): jmp {targets_str}")
+                print(f"      {i}: jmp {targets_str}")
             elif isinstance(instr, Phi):
                 incomings_str = ", ".join(f"{inc.block}={inc.value}" for inc in instr.incomings)
-                print(f"      {i} (val_local_idx={instr.val_local_idx}): phi {instr.dest} [{incomings_str}]")
+                print(f"      {i}: phi {instr.dest} [{incomings_str}]")
         print()
 
 

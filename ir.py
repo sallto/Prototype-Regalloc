@@ -19,7 +19,6 @@ class ParseError(Exception):
 @dataclass
 class Instruction:
     kind: str  # "op", "jmp", or "phi"
-    val_local_idx: int
 
 
 @dataclass
@@ -27,8 +26,8 @@ class Op(Instruction):
     uses: List[str]
     defs: List[str]
 
-    def __init__(self, val_local_idx: int, uses: List[str] = [], defs: List[str] = []):
-        super().__init__(kind="op", val_local_idx=val_local_idx)
+    def __init__(self, uses: List[str] = [], defs: List[str] = []):
+        super().__init__(kind="op")
         self.uses = uses
         self.defs = defs
 
@@ -37,8 +36,8 @@ class Op(Instruction):
 class Jump(Instruction):
     targets: List[str]
 
-    def __init__(self, val_local_idx: int, targets: List[str]):
-        super().__init__(kind="jmp", val_local_idx=val_local_idx)
+    def __init__(self, targets: List[str]):
+        super().__init__(kind="jmp")
         self.targets = targets
 
 
@@ -53,8 +52,8 @@ class Phi(Instruction):
     dest: str
     incomings: List[PhiIncoming]
 
-    def __init__(self, val_local_idx: int, dest: str, incomings: List[PhiIncoming]):
-        super().__init__(kind="phi", val_local_idx=val_local_idx)
+    def __init__(self, dest: str, incomings: List[PhiIncoming]):
+        super().__init__(kind="phi")
         self.dest = dest
         self.incomings = incomings
 
@@ -92,11 +91,13 @@ class Function:
     name: str
     blocks: Dict[str, Block]
     next_use_distances: Dict[Tuple[str, int], List[float]] = None
+    value_indices: Dict[str, int] = None
 
     def __init__(self, name: str):
         self.name = name
         self.blocks = {}
         self.next_use_distances = {}
+        self.value_indices = {}
 
     def add_block(self, block: Block) -> None:
         self.blocks[block.name] = block
