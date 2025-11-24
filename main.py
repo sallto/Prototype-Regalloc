@@ -236,6 +236,75 @@ def print_function(function: Function) -> None:
         print()
 
 
+
+
+def print_function_with_spills(function: Function, spills_reloads: Dict[str, List[SpillReload]]) -> None:
+    """
+    Print the function IR with spill and reload instructions inserted at correct positions.
+
+    Args:
+        function: The Function object to print
+        spills_reloads: Dictionary mapping block names to lists of SpillReload operations
+    """
+    print(f"function {function.name}")
+    print()
+
+    # Process blocks in the order they appear in function.blocks
+    for block_name, block in function.blocks.items():
+        print(f"block {block_name}:")
+
+        # Get all operations for this block (already sorted by position)
+        operations = spills_reloads.get(block_name, [])
+
+        # Use an iterator to process operations in order
+        op_iter = iter(operations)
+        next_op = None
+        try:
+            next_op = next(op_iter)
+        except StopIteration:
+            next_op = None
+
+        # Process each original instruction
+        for instr_idx, instr in enumerate(block.instructions):
+            # Print all operations that should appear before this instruction (position == instr_idx)
+            while next_op is not None and next_op.position == instr_idx:
+                print(f"  {next_op.type} {next_op.variable}")
+                try:
+                    next_op = next(op_iter)
+                except StopIteration:
+                    next_op = None
+
+            # Print the original instruction
+            if isinstance(instr, Op):
+                uses_str = ",".join(instr.uses) if instr.uses else ""
+                defs_str = ",".join(instr.defs) if instr.defs else ""
+                parts = []
+                if uses_str:
+                    parts.append(f"uses={uses_str}")
+                if defs_str:
+                    parts.append(f"defs={defs_str}")
+                op_line = "op"
+                if parts:
+                    op_line += " " + " ".join(parts)
+                print(f"  {op_line}")
+            elif isinstance(instr, Jump):
+                targets_str = ",".join(instr.targets)
+                print(f"  jmp {targets_str}")
+            elif isinstance(instr, Phi):
+                incomings_str = ", ".join(f"{inc.block}, {inc.value}" for inc in instr.incomings)
+                print(f"  phi {instr.dest} [{incomings_str}]")
+
+        # Handle operations after the last instruction (position >= len(block.instructions))
+        while next_op is not None:
+            print(f"  {next_op.type} {next_op.variable}")
+            try:
+                next_op = next(op_iter)
+            except StopIteration:
+                next_op = None
+
+        print()
+
+
 def test_parser(ir_file: str, k: int = 3) -> None:
     """Test the parser with IR from the specified file."""
     try:
@@ -279,7 +348,7 @@ def test_parser(ir_file: str, k: int = 3) -> None:
         # Print the IR with spills and reloads
         print(f"IR with Spills and Reloads (k={k}):")
         print("=" * 50)
-        min_algorithm.print_function_with_spills(function, spills_reloads)
+        print_function_with_spills(function, spills_reloads)
 
     except ParseError as e:
         print(f"Parse error: {e}")
