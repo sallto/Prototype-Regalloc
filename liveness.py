@@ -796,7 +796,32 @@ def compute_next_use_distances(
     return distances
 
 
-def compute_register_pressure(block: Block) -> int:
+def get_next_use_distance(block: Block, var: str, current_idx: int, function: Function) -> float:
+    """
+    Get the next-use distance for a variable at a given instruction index.
+    
+    Args:
+        block: The block containing the variable
+        var: The variable name
+        current_idx: The current instruction index (0-based from block start)
+        function: The function containing value_indices mapping
+        
+    Returns:
+        Distance to next use, or math.inf if no future use exists
+    """
+    if var not in function.value_indices:
+        return math.inf
+    val_idx = function.value_indices[var]
+    if not hasattr(block, 'next_use_distances_by_val') or val_idx not in block.next_use_distances_by_val:
+        return math.inf
+    use_positions = block.next_use_distances_by_val[val_idx]
+    for pos in use_positions:
+        if pos >= current_idx:
+            return pos - current_idx
+    return math.inf
+
+
+def compute_register_pressure(block: Block, function: Function) -> int:
     """
     Compute the maximum register pressure for a block by tracking live variables
     at each instruction point.
@@ -807,6 +832,7 @@ def compute_register_pressure(block: Block) -> int:
 
     Args:
         block: The block to analyze
+        function: The function containing value_indices mapping
 
     Returns:
         Maximum number of live variables at any point in the block
@@ -845,10 +871,9 @@ def compute_register_pressure(block: Block) -> int:
         if isinstance(instr, Op):
             # Variables used here may become dead if they have no more finite uses
             for var in instr.uses:
-                if hasattr(block, 'next_use_by_instr') and block.next_use_by_instr and i < len(block.next_use_by_instr):
-                    next_uses = block.next_use_by_instr[i]
-                    if var in next_uses and next_uses[var] == float('inf') and var not in live_out_vars:
-                        live_vars.discard(var)
+                next_use_dist = get_next_use_distance(block, var, i, function)
+                if next_use_dist == float('inf') and var not in live_out_vars:
+                    live_vars.discard(var)
 
             # Variables defined here kill their previous live status (unless live out)
             for var in instr.defs:
@@ -856,11 +881,10 @@ def compute_register_pressure(block: Block) -> int:
                     live_vars.discard(var)
 
             # Newly defined variables are live if they have finite next uses or are live out
-            if hasattr(block, 'next_use_by_instr') and block.next_use_by_instr and i < len(block.next_use_by_instr):
-                next_uses = block.next_use_by_instr[i]
-                for var in instr.defs:
-                    if (var in next_uses and next_uses[var] != float('inf')) or var in live_out_vars:
-                        live_vars.add(var)
+            for var in instr.defs:
+                next_use_dist = get_next_use_distance(block, var, i, function)
+                if next_use_dist != float('inf') or var in live_out_vars:
+                    live_vars.add(var)
 
         elif isinstance(instr, Phi):
             # Phi destinations are defined here
@@ -868,10 +892,9 @@ def compute_register_pressure(block: Block) -> int:
                 live_vars.discard(instr.dest)
 
             # Phi destinations are live if they have finite next uses or are live out
-            if hasattr(block, 'next_use_by_instr') and block.next_use_by_instr and i < len(block.next_use_by_instr):
-                next_uses = block.next_use_by_instr[i]
-                if (instr.dest in next_uses and next_uses[instr.dest] != float('inf')) or instr.dest in live_out_vars:
-                    live_vars.add(instr.dest)
+            next_use_dist = get_next_use_distance(block, instr.dest, i, function)
+            if next_use_dist != float('inf') or instr.dest in live_out_vars:
+                live_vars.add(instr.dest)
 
         # Count pressure at the end of this instruction
         max_pressure = max(max_pressure, len(live_vars))
@@ -964,52 +987,46 @@ def compute_block_next_use_distances(function: Function) -> None:
 
 
 
-def compute_per_instruction_next_use_distances(function: Function) -> None:
+def compute_per_value_next_use_distances(function: Function) -> None:
     """
-    Compute next-use distances for every value at every instruction within each block.
-    For each instruction, records the distance to the next use of each value that appears
-    in its uses or defs. Values with no later use in the block get infinity.
+    Compute next-use distances for every value within each block.
+    For each value, stores a list of instruction indices (distances from block start)
+    where the value is used. The list is sorted in chronological order.
 
     Args:
         function: The Function object to analyze
     """
     for block in function.blocks.values():
-        # Initialize the next_use_by_instr list with empty dicts
-        block.next_use_by_instr = [{} for _ in block.instructions]
+        # Initialize the next_use_distances_by_val dict
+        block.next_use_distances_by_val = {}
 
-        # Track the next use position for each value in this block
-        next_pos: Dict[str, int] = {}
+        # Collect all uses of each value throughout the block
+        # Map from variable name to list of instruction indices where it's used
+        value_uses: Dict[str, List[int]] = {}
 
-        # Walk instructions in reverse order
-        for i in reversed(range(len(block.instructions))):
+        # Walk instructions in forward order to collect use positions
+        for i in range(len(block.instructions)):
             instr = block.instructions[i]
 
-            # For each value in uses or defs of this instruction, record its next-use distance
-            values_to_record = set()
             if isinstance(instr, Op):
-                values_to_record.update(instr.uses)
-                values_to_record.update(instr.defs)
-            elif isinstance(instr, Phi):
-                values_to_record.add(instr.dest)
-                for incoming in instr.incomings:
-                    values_to_record.add(incoming.value)
-
-            for value in values_to_record:
-                if value in next_pos:
-                    distance = next_pos[value] - i
-                else:
-                    distance = math.inf
-                block.next_use_by_instr[i][value] = distance
-
-            # Update next_pos for all values used in this instruction
-            # (defs are not set here since they are defined at this instruction,
-            #  not used at this instruction)
-            if isinstance(instr, Op):
+                # Record uses at this instruction index
                 for use in instr.uses:
-                    next_pos[use] = i
+                    if use not in value_uses:
+                        value_uses[use] = []
+                    value_uses[use].append(i)
             elif isinstance(instr, Phi):
+                # Record phi incoming values as uses
                 for incoming in instr.incomings:
-                    next_pos[incoming.value] = i
+                    if incoming.value not in value_uses:
+                        value_uses[incoming.value] = []
+                    value_uses[incoming.value].append(i)
+
+        # Convert variable names to val_idx and store in block.next_use_distances_by_val
+        for var, use_positions in value_uses.items():
+            if var in function.value_indices:
+                val_idx = function.value_indices[var]
+                # Store sorted list of use positions (distances from block start)
+                block.next_use_distances_by_val[val_idx] = sorted(use_positions)
 
 
 def compute_liveness(function: Function) -> None:
@@ -1046,9 +1063,9 @@ def compute_liveness(function: Function) -> None:
     # Phase 4: Propagate next-use distances within loops
     propagate_next_use_distances(function, loop_forest, loop_membership, loop_edges)
 
-    # Phase 5: Compute per-instruction next-use distances within each block
-    compute_per_instruction_next_use_distances(function)
+    # Phase 5: Compute per-value next-use distances within each block
+    compute_per_value_next_use_distances(function)
 
     # Phase 6: Compute register pressure for all blocks
     for block in function.blocks.values():
-        block.max_register_pressure = compute_register_pressure(block)
+        block.max_register_pressure = compute_register_pressure(block, function)

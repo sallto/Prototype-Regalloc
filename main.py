@@ -18,6 +18,7 @@ Grammar:
 from ir import *
 import liveness
 import min_algorithm
+from liveness import get_next_use_distance
 import argparse
 import sys
 
@@ -216,13 +217,12 @@ def print_function(function: Function) -> None:
 
                 # Show next-use distances for values in this instruction
                 next_use_str = ""
-                if block.next_use_by_instr and i < len(block.next_use_by_instr):
+                if hasattr(block, 'next_use_distances_by_val') and block.next_use_distances_by_val:
                     next_uses = []
                     for var in sorted(set(instr.uses + instr.defs)):
-                        if var in block.next_use_by_instr[i]:
-                            dist = block.next_use_by_instr[i][var]
-                            dist_str = "inf" if dist == float('inf') else str(int(dist))
-                            next_uses.append(f"{var}:{dist_str}")
+                        dist = get_next_use_distance(block, var, i, function)
+                        dist_str = "inf" if dist == float('inf') else str(int(dist))
+                        next_uses.append(f"{var}:{dist_str}")
                     if next_uses:
                         next_use_str = f" next_use={{{', '.join(next_uses)}}}"
 

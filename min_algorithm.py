@@ -13,7 +13,7 @@ import math
 from typing import Dict, List, Set, Union
 from dataclasses import dataclass
 from ir import Function, Block, Op, Jump, Phi
-from liveness import compute_liveness, build_loop_forest
+from liveness import compute_liveness, build_loop_forest, get_next_use_distance
 from collections import defaultdict
 
 
@@ -35,7 +35,7 @@ class SpillReload:
             return f"{self.type} {self.variable} at {location}"
 
 
-def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills: List[SpillReload]) -> Set[str]:
+def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills: List[SpillReload], function: Function) -> Set[str]:
     """
     Evict variables from W to keep only m variables with closest next-use distances.
 
@@ -46,6 +46,7 @@ def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills:
         block: Block containing the instruction
         m: Maximum number of variables to keep in registers
         spills: List to append spill operations to
+        function: The function containing value_indices mapping
 
     Returns:
         New set W with at most m variables
@@ -65,13 +66,8 @@ def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills:
             # Don't spill it before the redefinition
             next_use_dist = math.inf
         else:
-            # Scan forward from insn_idx to find next use of this variable
-            next_use_dist = math.inf
-            for future_idx in range(insn_idx, len(block.instructions)):
-                future_instr = block.instructions[future_idx]
-                if isinstance(future_instr, Op) and var in future_instr.uses:
-                    next_use_dist = future_idx - insn_idx
-                    break
+            # Use the helper function to get next-use distance from the new data structure
+            next_use_dist = get_next_use_distance(block, var, insn_idx, function)
 
             # If variable is live out and not used in this block, use the live_out distance
             if next_use_dist == math.inf and hasattr(block, 'live_out') and isinstance(block.live_out, dict) and var in block.live_out:
@@ -208,42 +204,16 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function:
     # If we have more variables in take than available registers,
     # select the k best ones from take based on next-use distance
     if len(take) > k:
-        # Get next-use distances for take variables
-        next_uses = {}
+        # Get next-use distances for take variables using helper function
         first_instr_idx = 0
-
-        for var in take:
-            # Scan forward from first instruction to find next use of this variable
-            next_use_dist = float('inf')
-            for future_idx in range(first_instr_idx, len(block.instructions)):
-                future_instr = block.instructions[future_idx]
-                if isinstance(future_instr, Op) and var in future_instr.uses:
-                    next_use_dist = future_idx - first_instr_idx
-                    break
-            next_uses[var] = next_use_dist
-
-        # Sort take by next-use distance (closest first) and take top k
-        sorted_take = sorted(take, key=lambda v: next_uses.get(v, float('inf')))
+        sorted_take = sorted(take, key=lambda v: get_next_use_distance(block, v, first_instr_idx, function))
         take = set(sorted_take[:k])
 
     # Sort remaining candidates by next-use distance at block entry
     if cand:
-        # Get next-use distances from the first instruction
-        next_uses = {}
+        # Get next-use distances from the first instruction using helper function
         first_instr_idx = 0
-
-        for var in cand:
-            # Scan forward from first instruction to find next use of this variable
-            next_use_dist = float('inf')
-            for future_idx in range(first_instr_idx, len(block.instructions)):
-                future_instr = block.instructions[future_idx]
-                if isinstance(future_instr, Op) and var in future_instr.uses:
-                    next_use_dist = future_idx - first_instr_idx
-                    break
-            next_uses[var] = next_use_dist
-
-        # Sort by next-use distance (closest first)
-        sorted_cand = sorted(cand, key=lambda v: next_uses.get(v, float('inf')))
+        sorted_cand = sorted(cand, key=lambda v: get_next_use_distance(block, v, first_instr_idx, function))
     else:
         sorted_cand = []
 
@@ -552,11 +522,11 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             S.update(R)
 
             # First limit: make room for operands
-            W = limit(W, S, insn_idx, block, k, result[block_name])
+            W = limit(W, S, insn_idx, block, k, result[block_name], function)
 
             # Second limit: make room for results
             # For the last instruction, we need to handle this differently
-            W = limit(W, S, insn_idx, block, k - len(instr_defs), result[block_name])
+            W = limit(W, S, insn_idx, block, k - len(instr_defs), result[block_name], function)
 
 
             # Add newly defined variables to W
