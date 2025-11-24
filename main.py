@@ -19,6 +19,7 @@ from ir import *
 import liveness
 import min_algorithm
 from liveness import get_next_use_distance
+from min_algorithm import SpillReload
 import argparse
 import sys
 

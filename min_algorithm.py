@@ -49,22 +49,29 @@ def insert_spill_reload_sorted(operations_list: List[SpillReload], spill_reload:
         operations_list: List of SpillReload operations (must already be sorted)
         spill_reload: SpillReload operation to insert
     """
+    import traceback
+
     # Compute sort key: (position, type_priority, variable)
     type_priority = 0 if spill_reload.type == "spill" else 1
     key = (spill_reload.position, type_priority, spill_reload.variable)
-    
+
     # Find insertion point using binary search
     # Create a key function for comparison
     def get_key(op: SpillReload) -> tuple:
         op_type_priority = 0 if op.type == "spill" else 1
         return (op.position, op_type_priority, op.variable)
-    
-    # Find the insertion point
+
     keys = [get_key(op) for op in operations_list]
     insert_idx = bisect.bisect_left(keys, key)
-    
+
     # Insert at the found position
     operations_list.insert(insert_idx, spill_reload)
+
+    # Debug: Check if inserted at the end; if not, print stacktrace
+    if insert_idx != len(operations_list) - 1:
+        print("[WARN] insert_spill_reload_sorted: Value not inserted at end (insert_idx = {}, list_len = {}). Stacktrace:".format(insert_idx, len(operations_list)))
+        traceback.print_stack()
+
 
 
 def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills: List[SpillReload], function: Function) -> Set[str]:
@@ -86,31 +93,9 @@ def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills:
     if not W or len(W) <= m:
         return W
 
-    # Get next-use distances for variables in W from this instruction onwards
-    next_uses = {}
-    for var in W:
-        # Check if variable is defined at the current instruction
-        current_instr = block.instructions[insn_idx] if insn_idx < len(block.instructions) else None
-        is_defined_here = (current_instr and isinstance(current_instr, Op) and var in current_instr.defs)
-
-        if is_defined_here:
-            # Variable is redefined at this instruction, so its current value will be overwritten
-            # Don't spill it before the redefinition
-            next_use_dist = math.inf
-        else:
-            # Use the helper function to get next-use distance from the new data structure
-            next_use_dist = get_next_use_distance(block, var, insn_idx, function)
-
-            # If variable is live out and not used in this block, use the live_out distance
-            if next_use_dist == math.inf and hasattr(block, 'live_out') and isinstance(block.live_out, dict) and var in block.live_out:
-                # live_out[var] is the distance from block exit, so add distance to exit
-                distance_to_exit = len(block.instructions) - insn_idx
-                next_use_dist = distance_to_exit + block.live_out[var]
-
-        next_uses[var] = next_use_dist
-
     # Sort W by next-use distance (closest first: smallest distance first)
-    sorted_vars = sorted(W, key=lambda v: next_uses.get(v, math.inf))
+    # get_next_use_distance handles variables defined at current instruction (returns 0)
+    sorted_vars = sorted(W, key=lambda v: get_next_use_distance(block, v, insn_idx, function))
 
     # Keep only the first m variables, evict the rest
     kept_vars = set(sorted_vars[:m])
@@ -118,7 +103,7 @@ def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills:
 
     # Create spills for evicted variables that haven't been spilled before and have finite next use
     for var in evicted_vars:
-        next_use_dist = next_uses.get(var, math.inf)
+        next_use_dist = get_next_use_distance(block, var, insn_idx, function)
         if var not in S and next_use_dist != math.inf:
             insert_spill_reload_sorted(spills, SpillReload("spill", var, insn_idx, block.name))
 
@@ -218,6 +203,7 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function:
             # Count how many predecessors this phi var is available from
             available_from = sum(1 for pred in block.predecessors
                                if pred in pred_W_exits and var in pred_W_exits[pred])
+            assert(available_from == len(block.predecessors))
             if available_from > 0:
                 freq[var] = available_from
                 cand.add(var)

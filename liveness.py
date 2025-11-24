@@ -807,8 +807,17 @@ def get_next_use_distance(block: Block, var: str, current_idx: int, function: Fu
         function: The function containing value_indices mapping
         
     Returns:
-        Distance to next use, or math.inf if no future use exists
+        Distance to next use, or math.inf if no future use exists.
+        Returns 0 if the variable is defined at the current instruction.
     """
+    # Check if variable is defined at the current instruction
+    if current_idx < len(block.instructions):
+        current_instr = block.instructions[current_idx]
+        if isinstance(current_instr, Op) and var in current_instr.defs:
+            return 0.0
+        elif isinstance(current_instr, Phi) and current_instr.dest == var:
+            return 0.0
+    
     if var not in function.value_indices:
         return math.inf
     val_idx = function.value_indices[var]
@@ -816,7 +825,7 @@ def get_next_use_distance(block: Block, var: str, current_idx: int, function: Fu
         return math.inf
     use_positions = block.next_use_distances_by_val[val_idx]
     for pos in use_positions:
-        if pos >= current_idx:
+        if pos > current_idx:
             return pos - current_idx
     return math.inf
 
@@ -1022,11 +1031,31 @@ def compute_per_value_next_use_distances(function: Function) -> None:
                     value_uses[incoming.value].append(i)
 
         # Convert variable names to val_idx and store in block.next_use_distances_by_val
+        block_len = len(block.instructions)
         for var, use_positions in value_uses.items():
             if var in function.value_indices:
                 val_idx = function.value_indices[var]
                 # Store sorted list of use positions (distances from block start)
-                block.next_use_distances_by_val[val_idx] = sorted(use_positions)
+                sorted_positions = sorted(use_positions)
+                # Add liveout distance as the last entry
+                if isinstance(block.live_out, dict) and var in block.live_out:
+                    # live_out[var] is distance from block exit, so add block_len to get distance from start
+                    sorted_positions.append(block_len + block.live_out[var])
+                else:
+                    # Not live out, append infinity as the last entry
+                    sorted_positions.append(math.inf)
+                block.next_use_distances_by_val[val_idx] = sorted_positions
+        
+        # Handle variables that are in live_out but didn't appear in value_uses
+        if isinstance(block.live_out, dict):
+            for var in block.live_out:
+                if var in function.value_indices:
+                    val_idx = function.value_indices[var]
+                    # Only add if not already processed above
+                    if val_idx not in block.next_use_distances_by_val:
+                        # Variable is live out but has no uses in this block
+                        # Add liveout distance as the only entry
+                        block.next_use_distances_by_val[val_idx] = [block_len + block.live_out[var]]
 
 
 def compute_liveness(function: Function) -> None:
