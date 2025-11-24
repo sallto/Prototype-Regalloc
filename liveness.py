@@ -825,7 +825,7 @@ def get_next_use_distance(block: Block, var: str, current_idx: int, function: Fu
         return math.inf
     use_positions = block.next_use_distances_by_val[val_idx]
     for pos in use_positions:
-        if pos > current_idx:
+        if pos >= current_idx:
             return pos - current_idx
     return math.inf
 

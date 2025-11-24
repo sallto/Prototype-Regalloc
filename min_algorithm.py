@@ -11,12 +11,51 @@ pressure exceeds the available number of registers k.
 
 import math
 import bisect
-from typing import Dict, List, Set, Union
+from typing import Dict, List, Set, Union, Tuple
 from dataclasses import dataclass
 from ir import Function, Block, Op, Jump, Phi
 from liveness import compute_liveness, build_loop_forest, get_next_use_distance
 from collections import defaultdict
 
+def topological_order(function: Function) -> List[str]:
+    """
+    Return blocks in topological order (predecessors before successors).
+
+    Uses DFS-based topological sort. Entry blocks (no predecessors) come first.
+
+    Args:
+        function: The Function object with blocks
+
+    Returns:
+        List of block names in topological order
+    """
+    # Find entry blocks (blocks with no predecessors)
+    entry_blocks = [name for name, block in function.blocks.items() if not block.predecessors]
+
+    # If no blocks have predecessors, pick the first block as entry
+    if not entry_blocks:
+        entry_blocks = [list(function.blocks.keys())[0]]
+
+    visited = set()
+    order = []
+
+    def dfs(block_name: str):
+        if block_name in visited:
+            return
+        visited.add(block_name)
+
+        # Visit all successors
+        for successor in function.blocks[block_name].successors:
+            dfs(successor)
+
+        order.append(block_name)
+
+    # Start DFS from each entry block
+    for entry in entry_blocks:
+        dfs(entry)
+
+    # Reverse to get topological order (predecessors first)
+    return order[::-1]
 
 @dataclass
 class SpillReload:
@@ -114,45 +153,6 @@ def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills:
     return kept_vars
 
 
-def topological_order(function: Function) -> List[str]:
-    """
-    Return blocks in topological order (predecessors before successors).
-
-    Uses DFS-based topological sort. Entry blocks (no predecessors) come first.
-
-    Args:
-        function: The Function object with blocks
-
-    Returns:
-        List of block names in topological order
-    """
-    # Find entry blocks (blocks with no predecessors)
-    entry_blocks = [name for name, block in function.blocks.items() if not block.predecessors]
-
-    # If no blocks have predecessors, pick the first block as entry
-    if not entry_blocks:
-        entry_blocks = [list(function.blocks.keys())[0]]
-
-    visited = set()
-    order = []
-
-    def dfs(block_name: str):
-        if block_name in visited:
-            return
-        visited.add(block_name)
-
-        # Visit all successors
-        for successor in function.blocks[block_name].successors:
-            dfs(successor)
-
-        order.append(block_name)
-
-    # Start DFS from each entry block
-    for entry in entry_blocks:
-        dfs(entry)
-
-    # Reverse to get topological order (predecessors first)
-    return order[::-1]
 
 
 def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function: Function) -> Set[str]:
@@ -340,7 +340,7 @@ def sortByNextUse(vars: Set[str], entry_instr_idx: int, block: Block) -> List[st
 
 
 def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
-                   function: Function, k: int) -> Set[str]:
+                   function: Function, k: int) -> Tuple[Set[str], Set[str]]:
     """
     Initialize W_entry for a loop header block according to the Min algorithm.
 
@@ -351,7 +351,9 @@ def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
         k: Number of available registers
 
     Returns:
-        Set of variables that should be in registers at block entry
+        Tuple containing:
+        - Set of variables that should be in registers at block entry
+        - Set of variables that should be spilled before entering the loop
     """
     entry = 0  # Index of the first instruction
     loop = loopOf(block.name, loop_membership)
@@ -375,12 +377,16 @@ def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
         max_pressure = getLoopMaxPressure(loop, loop_membership, function)
         print(f"max_pressure: {max_pressure}")
         freeLoop = k - max_pressure + len(liveThrough)
+        
+        if freeLoop < 0:
+            freeLoop = 0
 
         # sort(liveThrough, entry)
         sorted_liveThrough = sortByNextUse(liveThrough, entry, block)
 
         # add = liveThrough[0:freeLoop]
         add = set(sorted_liveThrough[:freeLoop])
+        liveThrough = liveThrough - add
     else:
         # sort(cand, entry)
         sorted_cand = sortByNextUse(cand, entry, block)
@@ -392,7 +398,7 @@ def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
         add = set()
 
     # return cand ∪ add
-    return cand | add
+    return cand | add, liveThrough
 
 
 def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]]:
@@ -435,18 +441,20 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             # Check if this block is a loop header
             if block_name in loop_membership:
                 # Use initLoopHeader for loop headers
-                W_entry = initLoopHeader(block, loop_membership, function, k)
+                W_entry, liveThrough = initLoopHeader(block, loop_membership, function, k)
+                S_entry = liveThrough
             else:
                 # Use initUsual for non-loop headers
                 pred_W_exits = {pred: W_exit_map.get(pred, set()) for pred in block.predecessors}
                 W_entry = initUsual(block, pred_W_exits, k, function)
+                S_entry = set()
 
-            # Compute S_entry: variables spilled on some path to this block
-            S_entry = set()
+            # Compute S_entry: variables spilled on some path to this block or not in W_entry but live_out
+
             for pred in block.predecessors:
                 if pred in S_exit_map:
-                    S_entry.update(S_exit_map[pred])
-            S_entry &= W_entry  # Only consider variables that are in W_entry
+                    S_entry.update(S_exit_map[pred] & W_entry)
+            
 
         # Insert coupling code for each predecessor that has already been processed
         for pred_name in block.predecessors:
@@ -456,62 +464,39 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
 
             pred_W_exit = W_exit_map[pred_name]
             pred_S_exit = S_exit_map.get(pred_name, set())
-
-            # For phi nodes, ensure incoming values are available at block boundary
-            # Only reload phi incoming values that come from this specific predecessor
-            phi_incoming_vars = set()
-            for instr in block.instructions:
-                if isinstance(instr, Phi):
-                    for incoming in instr.incomings:
-                        if incoming.block == pred_name:
-                            phi_incoming_vars.add(incoming.value)
-            # Reload variables needed for phi incoming values that aren't in registers
-            phi_reload_vars = phi_incoming_vars - pred_W_exit
-            for var in phi_reload_vars:
-                # Insert reload before the last instruction in predecessor block
-                pred_block = function.blocks[pred_name]
-                insert_spill_reload_sorted(result[pred_name], SpillReload("reload", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
-
-            # Reload variables in (W_entry ∩ vars_available_from_pred) \ W_exit_pred on edge pred->block
-            # (excluding phi destinations and phi incoming values from this predecessor)
-            # Phi incoming values are handled separately above
-
-            # Variables that could potentially be reloaded from this predecessor:
-            # - Variables defined in the predecessor block (available at exit)
-            # - Variables that are live into the predecessor (but these would need to be reloaded even earlier)
             pred_block = function.blocks[pred_name]
-            vars_available_from_pred = set()
 
-            # Variables defined in predecessor are available at its exit
-            for instr in pred_block.instructions:
-                if isinstance(instr, Op) and instr.defs:
-                    vars_available_from_pred.update(instr.defs)
-                elif isinstance(instr, Phi) and instr.dest:
-                    vars_available_from_pred.add(instr.dest)
-
-            # Variables that are live into the predecessor might also be available
-            # (though they would need to be reloaded in an earlier predecessor)
-            if hasattr(pred_block, 'live_in') and isinstance(pred_block.live_in, dict):
-                vars_available_from_pred.update(pred_block.live_in.keys())
-
-            # Only reload variables that are both in W_entry AND available from this predecessor
-            all_phi_incoming_vars = set()
-            for instr in block.instructions:
-                if isinstance(instr, Phi):
-                    for incoming in instr.incomings:
-                        all_phi_incoming_vars.add(incoming.value)
-
-            reload_vars = (W_entry & vars_available_from_pred - pred_W_exit) - block.phi_defs - all_phi_incoming_vars
+            # Reload: All variables in W_entry \ W_exit_pred (excluding phi destinations)
+            reload_vars = (W_entry - pred_W_exit) - block.phi_defs
+            
+            # Check if reloading would exceed k registers
+            # After reloads, we'll have: pred_W_exit ∪ reload_vars
+            W_after_reload = (pred_W_exit | reload_vars )- pred_S_exit
+            if len(W_after_reload) > k:
+                # Need to spill some variables from pred_W_exit to make room for reloads
+                # Compute how many we need to spill
+                num_to_spill = len(W_after_reload) - k
+                
+                # Sort variables in pred_W_exit by next-use distance in the current block
+                # Use the first instruction index (0) as reference point
+                sorted_pred_vars = sorted(pred_W_exit, key=lambda v: get_next_use_distance(block, v, 0, function))
+                
+                # Spill the variables with furthest next use (last in sorted list)
+                vars_to_spill_for_reloads = set(sorted_pred_vars[-num_to_spill:])
+                
+                # Insert spills before reloads
+                for var in vars_to_spill_for_reloads:
+                    if get_next_use_distance(block, var, 0, function) != math.inf:
+                        insert_spill_reload_sorted(result[pred_name], SpillReload("spill", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+            
             for var in reload_vars:
-                # Insert reload before the last instruction in predecessor block
                 insert_spill_reload_sorted(result[pred_name], SpillReload("reload", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
-            # Spill variables in (S_entry \ S_exit_pred) ∩ W_exit_pred on edge pred->block
-            spill_vars = (S_entry - pred_S_exit) & pred_W_exit
+            # Spill: All variables in (S_entry \ S_exit_pred) ∩ W_exit_pred
+            spill_vars = ((S_entry - pred_S_exit) & pred_W_exit) #| ((pred_W_exit - pred_S_exit - W_entry) & block.live_in.keys())
             for var in spill_vars:
-                # Insert spill before the last instruction (typically the jump) in predecessor block
-                pred_block = function.blocks[pred_name]
-                insert_spill_reload_sorted(result[pred_name], SpillReload("spill", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+                if get_next_use_distance(block, var, 0, function) != math.inf:
+                    insert_spill_reload_sorted(result[pred_name], SpillReload("spill", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
         # Process block instructions starting with W = W_entry, S = S_entry
         W = W_entry.copy()
@@ -535,7 +520,7 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             # R = uses that are not already in registers (need reload)
             R = set(instr_uses) - W
 
-            # Add reloaded variables to both W and S
+            # Add reloaded variables to both W and S, and track them
             W.update(R)
             S.update(R)
 
@@ -543,7 +528,6 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             W = limit(W, S, insn_idx, block, k, result[block_name], function)
 
             # Second limit: make room for results
-            # For the last instruction, we need to handle this differently
             W = limit(W, S, insn_idx, block, k - len(instr_defs), result[block_name], function)
 
 
@@ -553,39 +537,6 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             # Create reload operations for variables in R (before the instruction)
             for var in R:
                 insert_spill_reload_sorted(result[block_name], SpillReload("reload", var, insn_idx, block_name))
-
-        # Check if we need to spill variables before entering loops with high register pressure
-        for succ_name in block.successors:
-            if succ_name in loop_membership:
-                # This successor is a loop header - check if loop has high register pressure
-                max_pressure = getLoopMaxPressure(succ_name, loop_membership, function)
-                if max_pressure > k:
-                    # Loop has high register pressure - spill variables not used in the loop
-                    succ_block = function.blocks[succ_name]
-                    # Compute the alive variables at loop header entry (same as initLoopHeader)
-                    alive_vars = succ_block.phi_defs | set(succ_block.live_in.keys()) if hasattr(succ_block, 'live_in') and isinstance(succ_block.live_in, dict) else succ_block.phi_defs
-                    used_in_loop = usedInLoop(succ_name, alive_vars, loop_membership, function)
-
-                    # Also consider phi incoming values that flow into used phi destinations
-                    phi_used_vars = set()
-                    for instr in succ_block.instructions:
-                        if isinstance(instr, Phi) and instr.dest in used_in_loop:
-                            for incoming in instr.incomings:
-                                phi_used_vars.add(incoming.value)
-                    used_in_loop.update(phi_used_vars)
-
-                    # Only consider variables that are live out of this block for spilling
-                    live_out_vars = set(block.live_out.keys()) if hasattr(block, 'live_out') and isinstance(block.live_out, dict) else set()
-                    # Variables in W that are live out but not used in the loop should be spilled
-                    vars_to_spill = ((W & live_out_vars) - used_in_loop) - block.phi_defs
-
-                    # Spill these variables at the last instruction (before jump to loop)
-                    last_idx = len(block.instructions) - 1
-                    for var in vars_to_spill:
-                        if var not in S:  # Only spill if not already spilled
-                            insert_spill_reload_sorted(result[block_name], SpillReload("spill", var, last_idx, block_name))
-                            W.remove(var)
-                            S.add(var)
 
         # Store exit state for this block
         W_exit_map[block_name] = W.copy()

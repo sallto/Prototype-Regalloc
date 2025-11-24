@@ -5,12 +5,36 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Python Debugger: main.py with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "integratedTerminal",
+            "args": "${command:pickArgs}"
+        },
+        {
             "name": "debug linear_gap",
             "type": "debugpy",
             "request": "launch",
             "program": "main.py",
             "console": "integratedTerminal",
             "args": "examples/linear_gap.ir"
+        },
+        {
+            "name": "Python Debugger: reg_pressure/merge_use.ir",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "integratedTerminal",
+            "args": "examples/reg_pressure/merge_use.ir"
+        },
+        {
+            "name": "Python Debugger: reg_pressure/loop_var.ir",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "integratedTerminal",
+            "args": "examples/reg_pressure/loop_var.ir"
         },
         {
             "name": "Python Debugger: main.py with Arguments",
