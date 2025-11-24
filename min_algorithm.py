@@ -10,6 +10,7 @@ pressure exceeds the available number of registers k.
 """
 
 import math
+import bisect
 from typing import Dict, List, Set, Union
 from dataclasses import dataclass
 from ir import Function, Block, Op, Jump, Phi
@@ -22,17 +23,48 @@ class SpillReload:
     """Represents a spill or reload operation."""
     type: str  # "spill" or "reload"
     variable: str
-    instruction_idx: int
+    position: int  # Position where this operation should be inserted (0 = before first instruction)
     block_name: str
     is_coupling: bool = False  # True if this is coupling code between blocks
     edge_info: str = ""  # For coupling operations: "pred->block"
 
     def __str__(self) -> str:
-        location = f"{self.block_name}:{self.instruction_idx}"
+        location = f"{self.block_name}:{self.position}"
         if self.is_coupling:
             return f"{self.type} {self.variable} at {location} (coupling: {self.edge_info})"
         else:
             return f"{self.type} {self.variable} at {location}"
+
+
+def insert_spill_reload_sorted(operations_list: List[SpillReload], spill_reload: SpillReload) -> None:
+    """
+    Insert a SpillReload into a list while maintaining sorted order.
+    
+    The list is sorted by (position, type_priority, variable) where:
+    - position: insertion position (0 = before first instruction)
+    - type_priority: 0 for "spill", 1 for "reload" (spills come before reloads)
+    - variable: variable name for stable sorting
+    
+    Args:
+        operations_list: List of SpillReload operations (must already be sorted)
+        spill_reload: SpillReload operation to insert
+    """
+    # Compute sort key: (position, type_priority, variable)
+    type_priority = 0 if spill_reload.type == "spill" else 1
+    key = (spill_reload.position, type_priority, spill_reload.variable)
+    
+    # Find insertion point using binary search
+    # Create a key function for comparison
+    def get_key(op: SpillReload) -> tuple:
+        op_type_priority = 0 if op.type == "spill" else 1
+        return (op.position, op_type_priority, op.variable)
+    
+    # Find the insertion point
+    keys = [get_key(op) for op in operations_list]
+    insert_idx = bisect.bisect_left(keys, key)
+    
+    # Insert at the found position
+    operations_list.insert(insert_idx, spill_reload)
 
 
 def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills: List[SpillReload], function: Function) -> Set[str]:
@@ -88,7 +120,7 @@ def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills:
     for var in evicted_vars:
         next_use_dist = next_uses.get(var, math.inf)
         if var not in S and next_use_dist != math.inf:
-            spills.append(SpillReload("spill", var, insn_idx, block.name))
+            insert_spill_reload_sorted(spills, SpillReload("spill", var, insn_idx, block.name))
 
     # Update S: remove evicted variables from the already spilled set
     # (since they're being evicted again, they need to be spilled again)
@@ -452,7 +484,7 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             for var in phi_reload_vars:
                 # Insert reload before the last instruction in predecessor block
                 pred_block = function.blocks[pred_name]
-                result[pred_name].append(SpillReload("reload", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+                insert_spill_reload_sorted(result[pred_name], SpillReload("reload", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
             # Reload variables in (W_entry ∩ vars_available_from_pred) \ W_exit_pred on edge pred->block
             # (excluding phi destinations and phi incoming values from this predecessor)
@@ -486,14 +518,14 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             reload_vars = (W_entry & vars_available_from_pred - pred_W_exit) - block.phi_defs - all_phi_incoming_vars
             for var in reload_vars:
                 # Insert reload before the last instruction in predecessor block
-                result[pred_name].append(SpillReload("reload", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+                insert_spill_reload_sorted(result[pred_name], SpillReload("reload", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
             # Spill variables in (S_entry \ S_exit_pred) ∩ W_exit_pred on edge pred->block
             spill_vars = (S_entry - pred_S_exit) & pred_W_exit
             for var in spill_vars:
                 # Insert spill before the last instruction (typically the jump) in predecessor block
                 pred_block = function.blocks[pred_name]
-                result[pred_name].append(SpillReload("spill", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+                insert_spill_reload_sorted(result[pred_name], SpillReload("spill", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
         # Process block instructions starting with W = W_entry, S = S_entry
         W = W_entry.copy()
@@ -534,7 +566,7 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
 
             # Create reload operations for variables in R (before the instruction)
             for var in R:
-                result[block_name].append(SpillReload("reload", var, insn_idx, block_name))
+                insert_spill_reload_sorted(result[block_name], SpillReload("reload", var, insn_idx, block_name))
 
         # Check if we need to spill variables before entering loops with high register pressure
         for succ_name in block.successors:
@@ -565,7 +597,7 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
                     last_idx = len(block.instructions) - 1
                     for var in vars_to_spill:
                         if var not in S:  # Only spill if not already spilled
-                            result[block_name].append(SpillReload("spill", var, last_idx, block_name))
+                            insert_spill_reload_sorted(result[block_name], SpillReload("spill", var, last_idx, block_name))
                             W.remove(var)
                             S.add(var)
 
@@ -597,7 +629,7 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             phi_reload_vars = phi_incoming_vars - block_W_exit
             for var in phi_reload_vars:
                 # Insert reload at the end of this block (before the jump to successor)
-                result[block_name].append(SpillReload("reload", var, len(block.instructions) - 1, block_name, is_coupling=True, edge_info=f"{block_name}->{succ_name}"))
+                insert_spill_reload_sorted(result[block_name], SpillReload("reload", var, len(block.instructions) - 1, block_name, is_coupling=True, edge_info=f"{block_name}->{succ_name}"))
 
     return result
 
@@ -617,29 +649,26 @@ def print_function_with_spills(function: Function, spills_reloads: Dict[str, Lis
     for block_name, block in function.blocks.items():
         print(f"block {block_name}:")
 
-        # Get all operations for this block (both coupling and intra-block)
+        # Get all operations for this block (already sorted by position)
         operations = spills_reloads.get(block_name, [])
 
-        # Separate operations by instruction index
-        ops_by_idx = {}
-        for op in operations:
-            idx = op.instruction_idx
-            if idx not in ops_by_idx:
-                ops_by_idx[idx] = []
-            ops_by_idx[idx].append(op)
-
-        # Sort operations at each index: spills before reloads
-        for idx in ops_by_idx:
-            ops_by_idx[idx].sort(key=lambda x: (0 if x.type == "spill" else 1, x.variable))
-
-        # Build the instruction sequence with spills/reloads inserted
+        # Use an iterator to process operations in order
+        op_iter = iter(operations)
+        next_op = None
+        try:
+            next_op = next(op_iter)
+        except StopIteration:
+            next_op = None
 
         # Process each original instruction
         for instr_idx, instr in enumerate(block.instructions):
-            # Handle operations before this instruction (reloads and spills from previous limit calls)
-            if instr_idx in ops_by_idx:
-                for op in ops_by_idx[instr_idx]:
-                    print(f"  {op.type} {op.variable}")
+            # Print all operations that should appear before this instruction (position == instr_idx)
+            while next_op is not None and next_op.position == instr_idx:
+                print(f"  {next_op.type} {next_op.variable}")
+                try:
+                    next_op = next(op_iter)
+                except StopIteration:
+                    next_op = None
 
             # Print the original instruction
             if isinstance(instr, Op):
@@ -661,11 +690,13 @@ def print_function_with_spills(function: Function, spills_reloads: Dict[str, Lis
                 incomings_str = ", ".join(f"{inc.block}, {inc.value}" for inc in instr.incomings)
                 print(f"  phi {instr.dest} [{incomings_str}]")
 
-        # Handle operations after the last instruction (coupling spills)
-        last_idx = len(block.instructions)
-        if last_idx in ops_by_idx:
-            for op in ops_by_idx[last_idx]:
-                print(f"  {op.type} {op.variable}")
+        # Handle operations after the last instruction (position >= len(block.instructions))
+        while next_op is not None:
+            print(f"  {next_op.type} {next_op.variable}")
+            try:
+                next_op = next(op_iter)
+            except StopIteration:
+                next_op = None
 
         print()
 
@@ -730,7 +761,7 @@ def test_min_algorithm():
         if coupling_ops:
             print("Coupling Operations (Block Boundaries):")
             print("-" * 40)
-            for op in sorted(coupling_ops, key=lambda x: (x.block_name, x.instruction_idx)):
+            for op in sorted(coupling_ops, key=lambda x: (x.block_name, x.position)):
                 print(f"  {op}")
             print()
 
@@ -746,7 +777,7 @@ def test_min_algorithm():
 
             if intra_block_ops:
                 print(f"Block {block_name}:")
-                for op in sorted(intra_block_ops, key=lambda x: x.instruction_idx):
+                for op in sorted(intra_block_ops, key=lambda x: x.position):
                     print(f"  {op}")
                     total_intra += 1
                 print()
