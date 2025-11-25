@@ -55,8 +55,10 @@ def parse_function(text: str) -> Function:
         line = lines[line_no]
         line_no += 1
 
-        # Skip empty lines
+        # Skip empty lines and comment lines
         if line.strip() == "":
+            continue
+        if line.strip().startswith(";"):
             continue
 
         # Check for block header
