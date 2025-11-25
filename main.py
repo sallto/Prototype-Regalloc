@@ -479,6 +479,375 @@ def print_function_with_colors(function: Function, spills_reloads: Dict[str, Lis
         print()
 
 
+def compute_register_state(function: Function, spills_reloads: Dict[str, List[SpillReload]], 
+                          color_assignment: Dict[str, int], k: int) -> Dict[Tuple[str, int], List[str]]:
+    """
+    Compute register state at each program point.
+    
+    Returns a mapping from (block_name, instruction_index) to register state.
+    Register state is a list of length k, where index i contains the variable name
+    in register i (or None if empty).
+    
+    Args:
+        function: The Function object
+        spills_reloads: Dictionary mapping block names to lists of SpillReload operations
+        color_assignment: Dictionary mapping variable names to their assigned colors
+        k: Number of available registers
+        
+    Returns:
+        Dictionary mapping (block_name, instruction_index) to register state list
+    """
+    from min_algorithm import topological_order, is_last_use
+    
+    register_states = {}
+    # Track register state across blocks: list of k elements, each is variable name or None
+    register_state = [None] * k
+    
+    # Track final state of each block for coupling code
+    block_final_states = {}
+    
+    # Get blocks in topological order
+    block_order = topological_order(function)
+    
+    # Process each block
+    for block_name in block_order:
+        block = function.blocks[block_name]
+        
+        # Initialize register state for this block entry
+        # For entry blocks, start empty. For others, start with state from predecessors
+        # (simplified: we'll process coupling code to update state)
+        if not block.predecessors:
+            # Entry block: start with empty registers
+            register_state = [None] * k
+        else:
+            # Non-entry block: initialize from live-in variables that have colors
+            # This is a simplification - coupling code will handle actual transitions
+            register_state = [None] * k
+            if isinstance(block.live_in, dict):
+                live_in_vars = set(block.live_in.keys())
+            elif isinstance(block.live_in, set):
+                live_in_vars = block.live_in
+            else:
+                live_in_vars = set()
+            
+            # Check for variables that should be in registers at block entry
+            # (those that are live-in, have colors, and weren't spilled)
+            for var in live_in_vars:
+                if var in color_assignment:
+                    reg_idx = color_assignment[var]
+                    # Check if this variable was spilled before entering this block
+                    # (spills at position 0 of this block indicate it was spilled)
+                    was_spilled = any(
+                        op.type == "spill" and op.variable == var and op.position == 0
+                        for op in spills_reloads.get(block_name, [])
+                    )
+                    if not was_spilled:
+                        register_state[reg_idx] = var
+        
+        # Store initial state for block (before first instruction)
+        register_states[(block_name, -1)] = register_state.copy()
+        
+        # Get all operations for this block (already sorted by position)
+        operations = spills_reloads.get(block_name, [])
+        
+        # Use an iterator to process operations in order
+        op_iter = iter(operations)
+        next_op = None
+        try:
+            next_op = next(op_iter)
+        except StopIteration:
+            next_op = None
+        
+        # Process each instruction
+        for instr_idx, instr in enumerate(block.instructions):
+            # Process all operations that should appear before this instruction
+            while next_op is not None and next_op.position == instr_idx:
+                if next_op.type == "spill":
+                    # Variable leaves register
+                    var = next_op.variable
+                    if var in color_assignment:
+                        reg_idx = color_assignment[var]
+                        if register_state[reg_idx] == var:
+                            register_state[reg_idx] = None
+                elif next_op.type == "reload":
+                    # Variable enters register
+                    var = next_op.variable
+                    if var in color_assignment:
+                        reg_idx = color_assignment[var]
+                        register_state[reg_idx] = var
+                try:
+                    next_op = next(op_iter)
+                except StopIteration:
+                    next_op = None
+            
+            # Get uses and defs for this instruction
+            if isinstance(instr, Op):
+                instr_uses = instr.uses
+                instr_defs = instr.defs
+            elif isinstance(instr, Phi):
+                instr_uses = []
+                instr_defs = [instr.dest]
+            else:
+                instr_uses = []
+                instr_defs = []
+            
+            # Process uses: if last use, free the register
+            for use_var in instr_uses:
+                if is_last_use(use_var, block, instr_idx, function):
+                    if use_var in color_assignment:
+                        reg_idx = color_assignment[use_var]
+                        if register_state[reg_idx] == use_var:
+                            register_state[reg_idx] = None
+            
+            # Process defs: variable enters its assigned register
+            for def_var in instr_defs:
+                if def_var in color_assignment:
+                    reg_idx = color_assignment[def_var]
+                    register_state[reg_idx] = def_var
+            
+            # Store state AFTER this instruction executes
+            register_states[(block_name, instr_idx)] = register_state.copy()
+        
+        # Handle operations after the last instruction
+        while next_op is not None:
+            if next_op.type == "spill":
+                var = next_op.variable
+                if var in color_assignment:
+                    reg_idx = color_assignment[var]
+                    if register_state[reg_idx] == var:
+                        register_state[reg_idx] = None
+            elif next_op.type == "reload":
+                var = next_op.variable
+                if var in color_assignment:
+                    reg_idx = color_assignment[var]
+                    register_state[reg_idx] = var
+            try:
+                next_op = next(op_iter)
+            except StopIteration:
+                next_op = None
+        
+        # Store final state for the block (after all instructions)
+        if block.instructions:
+            register_states[(block_name, len(block.instructions))] = register_state.copy()
+            block_final_states[block_name] = register_state.copy()
+        else:
+            # Empty block - store initial state
+            register_states[(block_name, 0)] = register_state.copy()
+            block_final_states[block_name] = register_state.copy()
+    
+    return register_states
+
+
+def print_function_with_register_state(function: Function, spills_reloads: Dict[str, List[SpillReload]], 
+                                       color_assignment: Dict[str, int], k: int) -> None:
+    """
+    Print the function IR with register state columns on the left and colored IR on the right.
+    
+    Args:
+        function: The Function object to print
+        spills_reloads: Dictionary mapping block names to lists of SpillReload operations
+        color_assignment: Dictionary mapping variable names to their assigned colors
+        k: Number of available registers
+    """
+    from min_algorithm import is_last_use
+    
+    # Determine column width for register columns
+    # Each register column should be wide enough for variable names (e.g., "%v0")
+    # Use a fixed width of 8 characters per register column
+    reg_col_width = 8
+    
+    def format_register_state(reg_state: List[str]) -> str:
+        """Format register state as a string with fixed-width columns."""
+        reg_state_parts = []
+        for i in range(k):
+            var = reg_state[i] if i < len(reg_state) else None
+            reg_state_parts.append((var if var else "").ljust(reg_col_width))
+        return "".join(reg_state_parts) + " |"
+    
+    # Print header row
+    header_parts = []
+    for i in range(k):
+        header_parts.append(f"R{i}".ljust(reg_col_width))
+    header = "".join(header_parts) + " |"
+    print(header)
+    
+    # Process blocks in the order they appear in function.blocks
+    for block_name, block in function.blocks.items():
+        # Initialize register state for this block
+        register_state = [None] * k
+        
+        # Initialize from live-in variables that have colors (simplified)
+        if isinstance(block.live_in, dict):
+            live_in_vars = set(block.live_in.keys())
+        elif isinstance(block.live_in, set):
+            live_in_vars = block.live_in
+        else:
+            live_in_vars = set()
+        
+        for var in live_in_vars:
+            if var in color_assignment:
+                reg_idx = color_assignment[var]
+                # Check if this variable was spilled before entering this block
+                was_spilled = any(
+                    op.type == "spill" and op.variable == var and op.position == 0
+                    for op in spills_reloads.get(block_name, [])
+                )
+                if not was_spilled:
+                    register_state[reg_idx] = var
+        
+        # Print block header
+        reg_state_str = format_register_state(register_state)
+        print(f"{reg_state_str}  block {block_name}:")
+        
+        # Get all operations for this block (already sorted by position)
+        operations = spills_reloads.get(block_name, [])
+        
+        # Use an iterator to process operations in order
+        op_iter = iter(operations)
+        next_op = None
+        try:
+            next_op = next(op_iter)
+        except StopIteration:
+            next_op = None
+        
+        # Process each original instruction
+        for instr_idx, instr in enumerate(block.instructions):
+            # Print all operations that should appear before this instruction (position == instr_idx)
+            while next_op is not None and next_op.position == instr_idx:
+                # Update register state based on operation
+                if next_op.type == "spill":
+                    var = next_op.variable
+                    if var in color_assignment:
+                        reg_idx = color_assignment[var]
+                        if register_state[reg_idx] == var:
+                            register_state[reg_idx] = None
+                elif next_op.type == "reload":
+                    var = next_op.variable
+                    if var in color_assignment:
+                        reg_idx = color_assignment[var]
+                        register_state[reg_idx] = var
+                
+                # Format and print
+                reg_state_str = format_register_state(register_state)
+                
+                if next_op.type == "reload":
+                    # Show color for reload operations
+                    color = color_assignment.get(next_op.variable, None)
+                    if color is not None:
+                        print(f"{reg_state_str}  {next_op.type} {next_op.variable} -> r{color}")
+                    else:
+                        print(f"{reg_state_str}  {next_op.type} {next_op.variable}")
+                else:
+                    # Spill operations don't need color (they're removing from register)
+                    print(f"{reg_state_str}  {next_op.type} {next_op.variable}")
+                
+                try:
+                    next_op = next(op_iter)
+                except StopIteration:
+                    next_op = None
+            
+            # Get uses and defs for this instruction
+            if isinstance(instr, Op):
+                instr_uses = instr.uses
+                instr_defs = instr.defs
+            elif isinstance(instr, Phi):
+                instr_uses = []
+                instr_defs = [instr.dest]
+            else:
+                instr_uses = []
+                instr_defs = []
+            
+            # Process uses: if last use, free the register
+            for use_var in instr_uses:
+                if is_last_use(use_var, block, instr_idx, function):
+                    if use_var in color_assignment:
+                        reg_idx = color_assignment[use_var]
+                        if register_state[reg_idx] == use_var:
+                            register_state[reg_idx] = None
+            
+            # Process defs: variable enters its assigned register
+            for def_var in instr_defs:
+                if def_var in color_assignment:
+                    reg_idx = color_assignment[def_var]
+                    register_state[reg_idx] = def_var
+            
+            # Format register state columns
+            reg_state_str = format_register_state(register_state)
+            
+            # Print the original instruction with colors at def points
+            if isinstance(instr, Op):
+                uses_str = ",".join(instr.uses) if instr.uses else ""
+                defs_str = ",".join(instr.defs) if instr.defs else ""
+                
+                # Add colors to defs
+                if defs_str:
+                    defs_with_colors = []
+                    for def_var in instr.defs:
+                        color = color_assignment.get(def_var, None)
+                        if color is not None:
+                            defs_with_colors.append(f"{def_var}->r{color}")
+                        else:
+                            defs_with_colors.append(def_var)
+                    defs_str = ",".join(defs_with_colors)
+                
+                parts = []
+                if uses_str:
+                    parts.append(f"uses={uses_str}")
+                if defs_str:
+                    parts.append(f"defs={defs_str}")
+                op_line = "op"
+                if parts:
+                    op_line += " " + " ".join(parts)
+                print(f"{reg_state_str}  {op_line}")
+            elif isinstance(instr, Jump):
+                targets_str = ",".join(instr.targets)
+                print(f"{reg_state_str}  jmp {targets_str}")
+            elif isinstance(instr, Phi):
+                # Show color for phi destination
+                dest_color = color_assignment.get(instr.dest, None)
+                dest_str = instr.dest
+                if dest_color is not None:
+                    dest_str = f"{instr.dest}->r{dest_color}"
+                
+                incomings_str = ", ".join(f"{inc.block}, {inc.value}" for inc in instr.incomings)
+                print(f"{reg_state_str}  phi {dest_str} [{incomings_str}]")
+        
+        # Handle operations after the last instruction (position >= len(block.instructions))
+        while next_op is not None:
+            # Update register state based on operation
+            if next_op.type == "spill":
+                var = next_op.variable
+                if var in color_assignment:
+                    reg_idx = color_assignment[var]
+                    if register_state[reg_idx] == var:
+                        register_state[reg_idx] = None
+            elif next_op.type == "reload":
+                var = next_op.variable
+                if var in color_assignment:
+                    reg_idx = color_assignment[var]
+                    register_state[reg_idx] = var
+            
+            # Format and print
+            reg_state_str = format_register_state(register_state)
+            
+            if next_op.type == "reload":
+                # Show color for reload operations
+                color = color_assignment.get(next_op.variable, None)
+                if color is not None:
+                    print(f"{reg_state_str}  {next_op.type} {next_op.variable} -> r{color}")
+                else:
+                    print(f"{reg_state_str}  {next_op.type} {next_op.variable}")
+            else:
+                # Spill operations don't need color
+                print(f"{reg_state_str}  {next_op.type} {next_op.variable}")
+            try:
+                next_op = next(op_iter)
+            except StopIteration:
+                next_op = None
+        
+        print()
+
+
 def test_parser(ir_file: str, k: int = 3) -> None:
     """Test the parser with IR from the specified file."""
     try:
@@ -556,6 +925,12 @@ def test_parser(ir_file: str, k: int = 3) -> None:
         print(f"IR with Register Colors (k={k}):")
         print("=" * 50)
         print_function_with_colors(function, spills_reloads, color_assignment)
+        print()
+        
+        # Print the IR with register state visualization
+        print(f"IR with Register State Visualization (k={k}):")
+        print("=" * 50)
+        print_function_with_register_state(function, spills_reloads, color_assignment, k)
 
     except ParseError as e:
         print(f"Parse error: {e}")
