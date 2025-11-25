@@ -18,6 +18,7 @@ Grammar:
 from ir import *
 import liveness
 import min_algorithm
+import dominators
 from liveness import get_next_use_distance
 from min_algorithm import SpillReload
 import argparse
@@ -191,7 +192,7 @@ def parse_phi_line(line: str, line_no: int) -> Phi:
 
 
 
-def print_function(function: Function) -> None:
+def print_function(function: Function, idom: dict = None, dom_tree: dict = None) -> None:
     """Pretty-print a parsed Function."""
     print(f"Function: {function.name}")
     print("Blocks:")
@@ -199,6 +200,16 @@ def print_function(function: Function) -> None:
         print(f"  {block_name}:")
         print(f"    Predecessors: {block.predecessors}")
         print(f"    Successors: {block.successors}")
+        if idom is not None:
+            immediate_dom = idom.get(block_name)
+            if immediate_dom is not None:
+                print(f"    Immediate Dominator: {immediate_dom}")
+            else:
+                print(f"    Immediate Dominator: (entry block)")
+        if dom_tree is not None:
+            children = dom_tree.get(block_name, [])
+            if children:
+                print(f"    Dominator Tree Children: {sorted(children)}")
         print(f"    USE set: {sorted(block.use_set) if block.use_set else 'empty'}")
         print(f"    DEF set: {sorted(block.def_set) if block.def_set else 'empty'}")
         print(f"    PhiUses: {sorted(block.phi_uses) if block.phi_uses else 'empty'}")
@@ -237,6 +248,63 @@ def print_function(function: Function) -> None:
         print()
 
 
+def print_dominator_tree(function: Function, idom: dict, dom_tree: dict = None) -> None:
+    """
+    Print the dominator tree in a tree-like format.
+    
+    Args:
+        function: The Function object
+        idom: Dictionary mapping blocks to their immediate dominators
+        dom_tree: Optional dictionary mapping blocks to their children in the dominator tree.
+                 If None, will be computed from idom.
+    """
+    if dom_tree is None:
+        dom_tree = dominators.build_dominator_tree(idom)
+    
+    # Find the root (entry block - has itself as idom or None)
+    root = None
+    for block_name, dom in idom.items():
+        if dom is None or dom == block_name:
+            root = block_name
+            break
+    
+    if root is None:
+        print("Dominator Tree: (no entry block found)")
+        return
+    
+    print("Dominator Tree:")
+    print("=" * 50)
+    
+    def print_tree_node(block_name: str, prefix: str = "", is_last: bool = True):
+        """Recursively print the dominator tree."""
+        # Print current node
+        connector = "└── " if is_last else "├── "
+        print(f"{prefix}{connector}{block_name}")
+        
+        # Update prefix for children
+        child_prefix = prefix + ("    " if is_last else "│   ")
+        
+        # Get children and sort for consistent output
+        children = sorted(dom_tree.get(block_name, []))
+        
+        # Print children
+        for i, child in enumerate(children):
+            is_last_child = (i == len(children) - 1)
+            print_tree_node(child, child_prefix, is_last_child)
+    
+    print_tree_node(root)
+    print()
+    
+    # Also print immediate dominators in a table format
+    print("Immediate Dominators:")
+    print("-" * 50)
+    for block_name in sorted(function.blocks.keys()):
+        dom = idom.get(block_name)
+        if dom is None or dom == block_name:
+            print(f"  {block_name:10s} -> (entry block)")
+        else:
+            print(f"  {block_name:10s} -> {dom}")
+    print()
 
 
 def print_function_with_spills(function: Function, spills_reloads: Dict[str, List[SpillReload]]) -> None:
@@ -339,6 +407,16 @@ def test_parser(ir_file: str, k: int = 3) -> None:
             print(f"Liveness correctness check failed: {e}")
             return
         print()
+
+        # Compute dominators
+        print("Computing dominator tree...")
+        idom = dominators.compute_dominators(function)
+        dom_tree = dominators.build_dominator_tree(idom)
+        print("Dominator tree computation completed!")
+        print()
+        
+        # Print dominator tree
+        print_dominator_tree(function, idom, dom_tree)
 
         # Run the Min algorithm for register allocation
         print(f"Running Min algorithm with k={k}...")
