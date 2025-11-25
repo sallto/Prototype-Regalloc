@@ -569,3 +569,318 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
                 insert_spill_reload_sorted(result[block_name], SpillReload("reload", var, len(block.instructions) - 1, block_name, is_coupling=True, edge_info=f"{block_name}->{succ_name}"))
 
     return result
+
+
+def get_spills_at(spills_reloads: Dict[str, List[SpillReload]], block_name: str, position: int) -> List[SpillReload]:
+    """
+    Get all spill operations at a given position in a block.
+    
+    Args:
+        spills_reloads: Dictionary mapping block names to lists of SpillReload operations
+        block_name: Name of the block
+        position: Instruction position (0 = before first instruction)
+        
+    Returns:
+        List of SpillReload operations that are spills at this position
+    """
+    if block_name not in spills_reloads:
+        return []
+    
+    result = []
+    for op in spills_reloads[block_name]:
+        if op.type == "spill" and op.position == position:
+            result.append(op)
+    
+    return result
+
+
+def is_last_use(var: str, block: Block, instr_idx: int, function: Function) -> bool:
+    """
+    Check if this is the last use of a variable in the block.
+    
+    A variable is at its last use if:
+    1. It's not live-out of the block, OR
+    2. It has no more uses after this instruction in the block
+    
+    Args:
+        var: Variable name to check
+        block: Block containing the instruction
+        instr_idx: Index of the current instruction
+        function: Function containing the block
+        
+    Returns:
+        True if this is the last use of the variable
+    """
+    # Check if variable is live-out
+    if isinstance(block.live_out, dict):
+        if var in block.live_out:
+            # Variable is live-out, so it's not the last use
+            return False
+    elif isinstance(block.live_out, set):
+        if var in block.live_out:
+            return False
+    
+    # Variable is not live-out, check if there are more uses in this block
+    # Scan forward from the next instruction
+    for i in range(instr_idx + 1, len(block.instructions)):
+        instr = block.instructions[i]
+        if isinstance(instr, Op):
+            if var in instr.uses:
+                return False
+        elif isinstance(instr, Phi):
+            # Check if var is used as an incoming value
+            for incoming in instr.incomings:
+                if incoming.value == var:
+                    return False
+    
+    # No more uses found, this is the last use
+    return True
+
+
+def color_recursive(block_name: str, k: int, color_assignment: Dict[str, int], 
+                    assigned: Set[int], dom_tree: Dict[str, List[str]], 
+                    function: Function, spills_reloads: Dict[str, List[SpillReload]]) -> None:
+    """
+    Recursively color variables in a basic block and its dominator tree children.
+    
+    This implements the SSA-based coloring algorithm that:
+    1. Marks colors of live-in variables as occupied
+    2. Processes each instruction, freeing colors on last use
+    3. Assigns colors to newly defined variables
+    4. Recurses on dominator tree children
+    
+    Args:
+        block_name: Name of the block to process
+        k: Number of available colors (registers)
+        color_assignment: Dictionary mapping variables to their assigned colors (ρ)
+        assigned: Set of currently assigned colors
+        dom_tree: Dominator tree mapping blocks to their children
+        function: Function containing the blocks
+        spills_reloads: Dictionary mapping blocks to spill/reload operations
+    """
+    block = function.blocks[block_name]
+    
+    # Reset assigned to only include colors of live-in variables
+    # All variables live-in have already been colored (by dominating blocks)
+    if isinstance(block.live_in, dict):
+        live_in_vars = set(block.live_in.keys())
+    elif isinstance(block.live_in, set):
+        live_in_vars = block.live_in
+    else:
+        live_in_vars = set()
+    
+    # Reset assigned set to only include colors of live-in variables
+    # But exclude variables that were spilled (they're not in registers)
+    assigned.clear()
+    
+    # Check for variables that were spilled - they don't occupy registers
+    spilled_vars = set()
+    
+    # Check spills at position 0 of this block
+    spills_at_start = get_spills_at(spills_reloads, block_name, 0)
+    spilled_vars.update(spill.variable for spill in spills_at_start)
+    
+    # Check if variables were spilled before entering this block
+    # If a variable was spilled at the end of any block and not reloaded at position 0,
+    # it doesn't occupy a register
+    for var in live_in_vars:
+        # Check if this variable was spilled at the end of any block
+        was_spilled_at_end = False
+        for other_block_name, other_spills in spills_reloads.items():
+            other_block = function.blocks.get(other_block_name)
+            if other_block:
+                for spill in other_spills:
+                    if spill.type == "spill" and spill.variable == var:
+                        # Check if spill is at the end of the block
+                        if spill.position >= len(other_block.instructions):
+                            was_spilled_at_end = True
+                            break
+                        elif spill.position == len(other_block.instructions) - 1:
+                            # Spill before last instruction - check if last is a jump
+                            if other_block.instructions and isinstance(other_block.instructions[-1], Jump):
+                                was_spilled_at_end = True
+                                break
+                if was_spilled_at_end:
+                    break
+        
+        # Also check spills at position 0 of this block (before first instruction)
+        was_spilled_at_start = any(
+            spill.variable == var for spill in spills_at_start
+        )
+        
+        # If it was spilled at the end of any block or at position 0, check if it's reloaded at position 0
+        if was_spilled_at_end or was_spilled_at_start:
+            has_reload_at_start = any(
+                op.type == "reload" and op.variable == var and op.position == 0
+                for op in spills_reloads.get(block_name, [])
+            )
+            if not has_reload_at_start:
+                spilled_vars.add(var)
+    
+    # Check for reloads at position 0 - these also indicate variables that were spilled
+    reloads_at_start = [op for op in spills_reloads.get(block_name, []) 
+                        if op.type == "reload" and op.position == 0]
+    spilled_vars.update(reload.variable for reload in reloads_at_start)
+    
+    for var in live_in_vars:
+        if var in color_assignment:
+            # Only mark color as occupied if variable wasn't spilled
+            # If it was spilled, it will be reloaded and get its color back then
+            if var not in spilled_vars:
+                assigned.add(color_assignment[var])
+    
+    # Process each instruction in the block
+    for i, instr in enumerate(block.instructions):
+        # Handle spills at this position - release their colors
+        for spill in get_spills_at(spills_reloads, block_name, i):
+            if spill.variable in color_assignment:
+                assigned.discard(color_assignment[spill.variable])
+        
+        # Handle reloads at this position - assign colors to reloaded variables
+        reloads_at_pos = [op for op in spills_reloads.get(block_name, []) 
+                          if op.type == "reload" and op.position == i]
+        for reload in reloads_at_pos:
+            if reload.variable not in color_assignment:
+                # Assign a color to the reloaded variable
+                available = set(range(k)) - assigned
+                if not available:
+                    # No available colors - raise exception
+                    available_colors = set(range(k))
+                    raise RuntimeError(
+                        f"Coloring failed: No available color for reloaded variable {reload.variable} "
+                        f"at position {i} in block {block_name}. "
+                        f"Available colors: {available_colors}, Assigned colors: {assigned}, "
+                        f"k={k}. All {k} registers are occupied."
+                    )
+                color = min(available)
+                color_assignment[reload.variable] = color
+                assigned.add(color)
+            else:
+                # Variable already has a color assignment (from previous block)
+                # Mark it as assigned
+                if reload.variable in color_assignment:
+                    assigned.add(color_assignment[reload.variable])
+        
+        # Get uses and defs for this instruction
+        if isinstance(instr, Op):
+            instr_uses = instr.uses
+            instr_defs = instr.defs
+        elif isinstance(instr, Phi):
+            # Phi instructions define their destination
+            # Uses come from incoming values, but those are handled at block boundaries
+            instr_uses = []
+            instr_defs = [instr.dest]
+        else:
+            # Jump instructions don't use or define variables
+            instr_uses = []
+            instr_defs = []
+        
+        # For each use, if last use, free the color
+        for use_var in instr_uses:
+            if is_last_use(use_var, block, i, function):
+                if use_var in color_assignment:
+                    assigned.discard(color_assignment[use_var])
+        
+        # For each def, assign a color from available colors
+        for def_var in instr_defs:
+            available = set(range(k)) - assigned
+            if not available:
+                # No available colors - try to free a color from a dead variable or one that will be spilled
+                # First, check if any variable will be spilled right after this instruction
+                # We can free its color now (but keep it in color_assignment for potential reload)
+                spills_after = get_spills_at(spills_reloads, block_name, i + 1)
+                for spill in spills_after:
+                    if spill.variable in color_assignment:
+                        color_val = color_assignment[spill.variable]
+                        if color_val in assigned:
+                            # This variable will be spilled right after, free its color now
+                            # Keep it in color_assignment in case it's reloaded later
+                            assigned.discard(color_val)
+                            available.add(color_val)
+                            break
+                
+                # If still no available colors, try to free a color from a dead variable
+                if not available:
+                    for var, color_val in sorted(color_assignment.items(), key=lambda x: x[1]):
+                        if color_val in assigned:
+                            # Check if this variable is dead
+                            is_dead = False
+                            if isinstance(block.live_out, dict):
+                                is_dead = var not in block.live_out
+                            elif isinstance(block.live_out, set):
+                                is_dead = var not in block.live_out
+                            else:
+                                is_dead = True
+                            
+                            # Also check if there are more uses after current instruction
+                            if is_dead:
+                                for j in range(i + 1, len(block.instructions)):
+                                    next_instr = block.instructions[j]
+                                    if isinstance(next_instr, Op) and var in next_instr.uses:
+                                        is_dead = False
+                                        break
+                            
+                            if is_dead:
+                                # Free this color - remove from assignment and assigned set
+                                del color_assignment[var]
+                                assigned.discard(color_val)
+                                available.add(color_val)
+                                break
+            
+            if available:
+                color = min(available)  # Pick lowest available color
+            else:
+                # No available colors - this shouldn't happen if spilling was correct
+                # Raise an exception to indicate coloring failure
+                available_colors = set(range(k))
+                raise RuntimeError(
+                    f"Coloring failed: No available color for variable {def_var} "
+                    f"at instruction {i} in block {block_name}. "
+                    f"Available colors: {available_colors}, Assigned colors: {assigned}, "
+                    f"k={k}. All {k} registers are occupied and no dead variables found."
+                )
+            color_assignment[def_var] = color
+            assigned.add(color)
+    
+    # Recurse on dominator tree children
+    for child in dom_tree.get(block_name, []):
+        # Pass a copy of assigned so each child gets the correct state
+        color_recursive(child, k, color_assignment, assigned.copy(), dom_tree, function, spills_reloads)
+
+
+def color_program(function: Function, k: int, spills_reloads: Dict[str, List[SpillReload]]) -> Dict[str, int]:
+    """
+    Color the program using SSA-based register coloring.
+    
+    This is the entry point for the coloring algorithm. It initializes the color
+    assignment dictionary and starts the recursive coloring from the entry block.
+    
+    Args:
+        function: Function to color
+        k: Number of available colors (registers)
+        spills_reloads: Dictionary mapping blocks to spill/reload operations
+        
+    Returns:
+        Dictionary mapping variable names to their assigned colors (0 to k-1)
+    """
+    from dominators import find_entry_block, build_dominator_tree, compute_dominators
+    
+    # Initialize color assignment dictionary (ρ)
+    color_assignment: Dict[str, int] = {}
+    
+    # Find entry block
+    entry_block = find_entry_block(function)
+    if entry_block is None:
+        return color_assignment
+    
+    # Compute dominator tree
+    idom = compute_dominators(function)
+    dom_tree = build_dominator_tree(idom)
+    
+    # Initialize assigned colors set
+    assigned: Set[int] = set()
+    
+    # Start recursive coloring from entry block
+    color_recursive(entry_block, k, color_assignment, assigned, dom_tree, function, spills_reloads)
+    
+    return color_assignment

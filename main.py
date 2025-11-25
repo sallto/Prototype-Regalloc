@@ -20,7 +20,7 @@ import liveness
 import min_algorithm
 import dominators
 from liveness import get_next_use_distance
-from min_algorithm import SpillReload
+from min_algorithm import SpillReload, color_program
 import argparse
 import sys
 
@@ -374,6 +374,111 @@ def print_function_with_spills(function: Function, spills_reloads: Dict[str, Lis
         print()
 
 
+def print_function_with_colors(function: Function, spills_reloads: Dict[str, List[SpillReload]], 
+                                color_assignment: Dict[str, int]) -> None:
+    """
+    Print the function IR with register colors shown at definition points and reloads.
+    
+    Args:
+        function: The Function object to print
+        spills_reloads: Dictionary mapping block names to lists of SpillReload operations
+        color_assignment: Dictionary mapping variable names to their assigned colors
+    """
+    print(f"function {function.name}")
+    print()
+
+    # Process blocks in the order they appear in function.blocks
+    for block_name, block in function.blocks.items():
+        print(f"block {block_name}:")
+
+        # Get all operations for this block (already sorted by position)
+        operations = spills_reloads.get(block_name, [])
+
+        # Use an iterator to process operations in order
+        op_iter = iter(operations)
+        next_op = None
+        try:
+            next_op = next(op_iter)
+        except StopIteration:
+            next_op = None
+
+        # Process each original instruction
+        for instr_idx, instr in enumerate(block.instructions):
+            # Print all operations that should appear before this instruction (position == instr_idx)
+            while next_op is not None and next_op.position == instr_idx:
+                if next_op.type == "reload":
+                    # Show color for reload operations
+                    color = color_assignment.get(next_op.variable, None)
+                    if color is not None:
+                        print(f"  {next_op.type} {next_op.variable} -> r{color}")
+                    else:
+                        print(f"  {next_op.type} {next_op.variable}")
+                else:
+                    # Spill operations don't need color (they're removing from register)
+                    print(f"  {next_op.type} {next_op.variable}")
+                try:
+                    next_op = next(op_iter)
+                except StopIteration:
+                    next_op = None
+
+            # Print the original instruction with colors at def points
+            if isinstance(instr, Op):
+                uses_str = ",".join(instr.uses) if instr.uses else ""
+                defs_str = ",".join(instr.defs) if instr.defs else ""
+                
+                # Add colors to defs
+                if defs_str:
+                    defs_with_colors = []
+                    for def_var in instr.defs:
+                        color = color_assignment.get(def_var, None)
+                        if color is not None:
+                            defs_with_colors.append(f"{def_var}->r{color}")
+                        else:
+                            defs_with_colors.append(def_var)
+                    defs_str = ",".join(defs_with_colors)
+                
+                parts = []
+                if uses_str:
+                    parts.append(f"uses={uses_str}")
+                if defs_str:
+                    parts.append(f"defs={defs_str}")
+                op_line = "op"
+                if parts:
+                    op_line += " " + " ".join(parts)
+                print(f"  {op_line}")
+            elif isinstance(instr, Jump):
+                targets_str = ",".join(instr.targets)
+                print(f"  jmp {targets_str}")
+            elif isinstance(instr, Phi):
+                # Show color for phi destination
+                dest_color = color_assignment.get(instr.dest, None)
+                dest_str = instr.dest
+                if dest_color is not None:
+                    dest_str = f"{instr.dest}->r{dest_color}"
+                
+                incomings_str = ", ".join(f"{inc.block}, {inc.value}" for inc in instr.incomings)
+                print(f"  phi {dest_str} [{incomings_str}]")
+
+        # Handle operations after the last instruction (position >= len(block.instructions))
+        while next_op is not None:
+            if next_op.type == "reload":
+                # Show color for reload operations
+                color = color_assignment.get(next_op.variable, None)
+                if color is not None:
+                    print(f"  {next_op.type} {next_op.variable} -> r{color}")
+                else:
+                    print(f"  {next_op.type} {next_op.variable}")
+            else:
+                # Spill operations don't need color
+                print(f"  {next_op.type} {next_op.variable}")
+            try:
+                next_op = next(op_iter)
+            except StopIteration:
+                next_op = None
+
+        print()
+
+
 def test_parser(ir_file: str, k: int = 3) -> None:
     """Test the parser with IR from the specified file."""
     try:
@@ -424,10 +529,33 @@ def test_parser(ir_file: str, k: int = 3) -> None:
         print("Min algorithm completed!")
         print()
 
+        # Run SSA-based coloring
+        print(f"Running SSA-based coloring with k={k}...")
+        color_assignment = color_program(function, k=k, spills_reloads=spills_reloads)
+        print("Coloring completed!")
+        print()
+
+        # Print color assignments
+        print(f"Register Color Assignments (k={k}):")
+        print("=" * 50)
+        if color_assignment:
+            sorted_vars = sorted(color_assignment.items(), key=lambda x: (x[1], x[0]))
+            for var, color in sorted_vars:
+                print(f"  {var} -> r{color}")
+        else:
+            print("  (no variables colored)")
+        print()
+
         # Print the IR with spills and reloads
         print(f"IR with Spills and Reloads (k={k}):")
         print("=" * 50)
         print_function_with_spills(function, spills_reloads)
+        print()
+
+        # Print the IR with colors at def points and reloads
+        print(f"IR with Register Colors (k={k}):")
+        print("=" * 50)
+        print_function_with_colors(function, spills_reloads, color_assignment)
 
     except ParseError as e:
         print(f"Parse error: {e}")
