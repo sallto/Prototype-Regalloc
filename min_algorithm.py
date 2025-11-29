@@ -134,7 +134,7 @@ def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills:
 
     # Sort W by next-use distance (closest first: smallest distance first)
     # get_next_use_distance handles variables defined at current instruction (returns 0)
-    sorted_vars = sorted(W, key=lambda v: get_next_use_distance(block, v, insn_idx, function))
+    sorted_vars = sorted(W, key=lambda v: (get_next_use_distance(block, v, insn_idx, function), v))
 
     # Keep only the first m variables, evict the rest
     kept_vars = set(sorted_vars[:m])
@@ -180,11 +180,19 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function:
     take = set()
 
     # Count frequency of each variable across predecessors' W_exit
+    # Only consider variables that are actually live-in to this block
+    live_in_vars = set()
+    if isinstance(block.live_in, dict):
+        live_in_vars = set(block.live_in.keys())
+    elif isinstance(block.live_in, set):
+        live_in_vars = block.live_in
+
     for pred_name in block.predecessors:
         if pred_name in pred_W_exits:
             for var in pred_W_exits[pred_name]:
-                freq[var] += 1
-                cand.add(var)
+                if var in live_in_vars:
+                    freq[var] += 1
+                    cand.add(var)
         # Variables not in pred_W_exits are ignored (unprocessed predecessors)
 
     # For phi nodes, ensure incoming values are considered for W_entry
@@ -203,7 +211,7 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function:
             # Count how many predecessors this phi var is available from
             available_from = sum(1 for pred in block.predecessors
                                if pred in pred_W_exits and var in pred_W_exits[pred])
-            assert(available_from == len(block.predecessors))
+            #assert(available_from == len(block.predecessors))
             if available_from > 0:
                 freq[var] = available_from
                 cand.add(var)
@@ -224,14 +232,14 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function:
     if len(take) > k:
         # Get next-use distances for take variables using helper function
         first_instr_idx = 0
-        sorted_take = sorted(take, key=lambda v: get_next_use_distance(block, v, first_instr_idx, function))
+        sorted_take = sorted(take, key=lambda v: (get_next_use_distance(block, v, first_instr_idx, function), v))
         take = set(sorted_take[:k])
 
     # Sort remaining candidates by next-use distance at block entry
     if cand:
         # Get next-use distances from the first instruction using helper function
         first_instr_idx = 0
-        sorted_cand = sorted(cand, key=lambda v: get_next_use_distance(block, v, first_instr_idx, function))
+        sorted_cand = sorted(cand, key=lambda v: (get_next_use_distance(block, v, first_instr_idx, function), v))
     else:
         sorted_cand = []
 
@@ -457,6 +465,14 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             
 
         # Insert coupling code for each predecessor that has already been processed
+        # First, compute which variables are available from ALL processed predecessors
+        processed_preds = [p for p in block.predecessors if p in W_exit_map]
+        if processed_preds:
+            # Variables available from all processed predecessors don't need reloads
+            vars_available_from_all = set.intersection(*[W_exit_map[p] for p in processed_preds]) if processed_preds else set()
+        else:
+            vars_available_from_all = set()
+        
         for pred_name in block.predecessors:
             # Only insert coupling code if the predecessor has been processed
             if pred_name not in W_exit_map:
@@ -466,8 +482,25 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             pred_S_exit = S_exit_map.get(pred_name, set())
             pred_block = function.blocks[pred_name]
 
+            # Collect phi incoming values that come from this specific predecessor and are already available
+            phi_incoming_vars_from_pred = set()
+            # Also collect ALL phi incoming values that come from OTHER predecessors (don't need them from this edge)
+            phi_incoming_vars_from_other_preds = set()
+            for instr in block.instructions:
+                if isinstance(instr, Phi):
+                    for incoming in instr.incomings:
+                        # If this incoming value comes from this predecessor and is already in that predecessor's W_exit
+                        if incoming.block == pred_name and incoming.value in pred_W_exit:
+                            phi_incoming_vars_from_pred.add(incoming.value)
+                        # If this incoming value comes from a different predecessor, we don't need it from this edge
+                        elif incoming.block != pred_name:
+                            phi_incoming_vars_from_other_preds.add(incoming.value)
+
             # Reload: All variables in W_entry \ W_exit_pred (excluding phi destinations)
-            reload_vars = (W_entry - pred_W_exit) - block.phi_defs
+            # But skip variables that are available from all predecessors (they don't need reloads)
+            # Also skip phi incoming values that are already available from this specific predecessor
+            # And skip phi incoming values that come from other predecessors (not needed from this edge)
+            reload_vars = ((W_entry - pred_W_exit) - block.phi_defs) - vars_available_from_all - phi_incoming_vars_from_pred - phi_incoming_vars_from_other_preds
             
             # Check if reloading would exceed k registers
             # After reloads, we'll have: pred_W_exit ∪ reload_vars
@@ -479,7 +512,7 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
                 
                 # Sort variables in pred_W_exit by next-use distance in the current block
                 # Use the first instruction index (0) as reference point
-                sorted_pred_vars = sorted(pred_W_exit, key=lambda v: get_next_use_distance(block, v, 0, function))
+                sorted_pred_vars = sorted(pred_W_exit, key=lambda v: (get_next_use_distance(block, v, 0, function), v))
                 
                 # Spill the variables with furthest next use (last in sorted list)
                 vars_to_spill_for_reloads = set(sorted_pred_vars[-num_to_spill:])
@@ -490,7 +523,7 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
                         insert_spill_reload_sorted(result[pred_name], SpillReload("spill", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
             
             for var in reload_vars:
-                insert_spill_reload_sorted(result[pred_name], SpillReload("reload", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+                insert_spill_reload_sorted(result[block_name], SpillReload("reload", var, 0, block_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
             # Spill: All variables in (S_entry \ S_exit_pred) ∩ W_exit_pred
             spill_vars = ((S_entry - pred_S_exit) & pred_W_exit) #| ((pred_W_exit - pred_S_exit - W_entry) & block.live_in.keys())

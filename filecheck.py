@@ -203,7 +203,8 @@ def match_pattern(pattern: str, line: str) -> bool:
 
 def verify_checks(checks: Dict[CheckType, List[CheckDirective]], 
                  sections: Dict[CheckType, List[str]], 
-                 k: int) -> Tuple[bool, List[str], List[str]]:
+                 k: int,
+                 file_name: str) -> Tuple[bool, List[str], List[str]]:
     """
     Verify that all CHECK directives match the output sections.
     Also detect missing checks (patterns in output without CHECK directives).
@@ -213,6 +214,7 @@ def verify_checks(checks: Dict[CheckType, List[CheckDirective]],
         checks: Dictionary of check types to directives
         sections: Dictionary of check types to output lines
         k: Number of registers to filter checks by
+        file_name: Name of the IR file being checked
     
     Returns (success, list of error messages, list of warnings about missing checks).
     """
@@ -228,7 +230,7 @@ def verify_checks(checks: Dict[CheckType, List[CheckDirective]],
         section_lines = sections.get(check_type, [])
         
         if not section_lines and directives:
-            errors.append(f"No output section found for {check_type.value} checks")
+            errors.append(f"{file_name}: No output section found for {check_type.value} checks")
             continue
         
         current_pos = 0  # Position in section_lines
@@ -244,14 +246,14 @@ def verify_checks(checks: Dict[CheckType, List[CheckDirective]],
                         break
                 if found:
                     errors.append(
-                        f"Line {directive.line_number}: CHECK-{check_type.value}-NOT pattern "
+                        f"{file_name}:{directive.line_number}: CHECK-{check_type.value}-NOT pattern "
                         f"'{directive.pattern}' found in output"
                     )
             elif directive.is_next:
                 # Pattern must match the very next line
                 if current_pos >= len(section_lines):
                     errors.append(
-                        f"Line {directive.line_number}: CHECK-{check_type.value}-NEXT pattern "
+                        f"{file_name}:{directive.line_number}: CHECK-{check_type.value}-NEXT pattern "
                         f"'{directive.pattern}' expected but reached end of output"
                     )
                 else:
@@ -260,7 +262,7 @@ def verify_checks(checks: Dict[CheckType, List[CheckDirective]],
                         current_pos += 1
                     else:
                         errors.append(
-                            f"Line {directive.line_number}: CHECK-{check_type.value}-NEXT pattern "
+                            f"{file_name}:{directive.line_number}: CHECK-{check_type.value}-NEXT pattern "
                             f"'{directive.pattern}' does not match line:\n"
                             f"  {section_lines[current_pos] if current_pos < len(section_lines) else '(end of output)'}"
                         )
@@ -277,7 +279,7 @@ def verify_checks(checks: Dict[CheckType, List[CheckDirective]],
                 
                 if not found:
                     errors.append(
-                        f"Line {directive.line_number}: CHECK-{check_type.value} pattern "
+                        f"{file_name}:{directive.line_number}: CHECK-{check_type.value} pattern "
                         f"'{directive.pattern}' not found in output"
                     )
         
@@ -303,7 +305,7 @@ def verify_checks(checks: Dict[CheckType, List[CheckDirective]],
                 
                 if not is_covered:
                     warnings.append(
-                        f"Missing CHECK-{check_type.value} directive for: {pattern.strip()}"
+                        f"{file_name}: Missing CHECK-{check_type.value} directive for: {pattern.strip()}"
                     )
     
     return len(errors) == 0, errors, warnings
@@ -390,7 +392,7 @@ def generate_checks(sections: Dict[CheckType, List[str]],
                 not line.startswith("function") and 
                 not line.startswith("block") and
                 not line.startswith("=") and
-                not "IR with" in line and
+                "IR with" not in line and
                 not line.startswith("R") and
                 "|" not in line and
                 line != ""):
@@ -411,8 +413,8 @@ def run_main_program(ir_file: str, k: int) -> str:
         )
         return result.stdout
     except subprocess.CalledProcessError as e:
-        print(f"Error running main.py: {e}", file=sys.stderr)
-        print(f"stderr: {e.stderr}", file=sys.stderr)
+        print(f"{ir_file}: Error running main.py: {e}", file=sys.stderr)
+        print(f"{ir_file}: stderr: {e.stderr}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -465,28 +467,28 @@ def main():
             total_checks += len(filtered)
         
         if total_checks == 0:
-            print("Warning: No CHECK directives found in IR file for k={}".format(args.registers), file=sys.stderr)
-            print("Use --update to generate CHECK directives", file=sys.stderr)
+            print(f"{args.file}: Warning: No CHECK directives found in IR file for k={args.registers}", file=sys.stderr)
+            print(f"{args.file}: Use --update to generate CHECK directives", file=sys.stderr)
             sys.exit(1)
         
-        success, errors, warnings = verify_checks(checks, sections, args.registers)
+        success, errors, warnings = verify_checks(checks, sections, args.registers, args.file)
         
         # Display warnings about missing checks
         if warnings:
-            print("Warning: Missing CHECK directives detected:", file=sys.stderr)
+            print(f"{args.file}: Warning: Missing CHECK directives detected:", file=sys.stderr)
             for warning in warnings:
                 print(f"  {warning}", file=sys.stderr)
             print("", file=sys.stderr)
         
         if success:
             if warnings:
-                print("All CHECK directives passed, but some patterns in output lack CHECK directives.")
+                print(f"{args.file}: All CHECK directives passed, but some patterns in output lack CHECK directives.")
                 sys.exit(0)
             else:
-                print("All CHECK directives passed!")
+                print(f"{args.file}: All CHECK directives passed!")
                 sys.exit(0)
         else:
-            print("CHECK directive verification failed:", file=sys.stderr)
+            print(f"{args.file}: CHECK directive verification failed:", file=sys.stderr)
             for error in errors:
                 print(f"  {error}", file=sys.stderr)
             sys.exit(1)

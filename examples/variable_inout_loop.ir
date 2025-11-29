@@ -15,3 +15,29 @@ block b1:
 
 block b3:
   op uses=%v0
+
+; CHECK directives (auto-generated for k=3)
+
+
+
+; CHECK directives (auto-generated for k=3)
+
+
+
+; CHECK directives (auto-generated for k=3)
+
+; CHECK-SPILL-K3 directives:
+; CHECK-SPILL-K3: op defs=%v0
+; CHECK-SPILL-K3: jmp b2
+; CHECK-SPILL-K3: op uses=%v0
+; CHECK-SPILL-K3: jmp b1,b3
+; CHECK-SPILL-K3: jmp b2
+; CHECK-SPILL-K3: op uses=%v0
+
+; CHECK-COLOR-K3 directives:
+; CHECK-COLOR-K3: op defs=%v0->r0
+; CHECK-COLOR-K3: jmp b2
+; CHECK-COLOR-K3: op uses=%v0
+; CHECK-COLOR-K3: jmp b1,b3
+; CHECK-COLOR-K3: jmp b2
+; CHECK-COLOR-K3: op uses=%v0

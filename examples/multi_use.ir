@@ -6,3 +6,27 @@ block b0:
   op defs=%v1
   op defs=%v2
   op uses=%v0
+
+; CHECK directives (auto-generated for k=3)
+
+
+
+; CHECK directives (auto-generated for k=3)
+
+
+
+; CHECK directives (auto-generated for k=3)
+
+; CHECK-SPILL-K3 directives:
+; CHECK-SPILL-K3: op defs=%v0
+; CHECK-SPILL-K3: op uses=%v0
+; CHECK-SPILL-K3: op defs=%v1
+; CHECK-SPILL-K3: op defs=%v2
+; CHECK-SPILL-K3: op uses=%v0
+
+; CHECK-COLOR-K3 directives:
+; CHECK-COLOR-K3: op defs=%v0->r0
+; CHECK-COLOR-K3: op uses=%v0
+; CHECK-COLOR-K3: op defs=%v1->r1
+; CHECK-COLOR-K3: op defs=%v2->r2
+; CHECK-COLOR-K3: op uses=%v0

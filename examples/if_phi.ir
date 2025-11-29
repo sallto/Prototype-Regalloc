@@ -8,3 +8,25 @@ block b1:
 block b2:
   phi %v3 [b0, %v0, b1, %v1]
   op uses=%v3
+
+; CHECK directives (auto-generated for k=3)
+
+
+
+; CHECK directives (auto-generated for k=3)
+
+; CHECK-SPILL-K3 directives:
+; CHECK-SPILL-K3: op defs=%v0
+; CHECK-SPILL-K3: jmp b1,b2
+; CHECK-SPILL-K3: op defs=%v1
+; CHECK-SPILL-K3: jmp b2
+; CHECK-SPILL-K3: phi %v3 [b0, %v0, b1, %v1]
+; CHECK-SPILL-K3: op uses=%v3
+
+; CHECK-COLOR-K3 directives:
+; CHECK-COLOR-K3: op defs=%v0->r0
+; CHECK-COLOR-K3: jmp b1,b2
+; CHECK-COLOR-K3: op defs=%v1->r0
+; CHECK-COLOR-K3: jmp b2
+; CHECK-COLOR-K3: phi %v3->r0 [b0, %v0, b1, %v1]
+; CHECK-COLOR-K3: op uses=%v3

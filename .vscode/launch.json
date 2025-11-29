@@ -37,6 +37,14 @@
             "args": "examples/reg_pressure/loop_var.ir"
         },
         {
+            "name": "Python Debugger: if_phi.ir",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "integratedTerminal",
+            "args": "examples/if_phi.ir"
+        },
+        {
             "name": "Python Debugger: main.py with Arguments",
             "type": "debugpy",
             "request": "launch",
