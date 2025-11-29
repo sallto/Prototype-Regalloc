@@ -14,6 +14,9 @@ import argparse
 from typing import List, Dict, Tuple, Optional, Set
 from dataclasses import dataclass, field
 from enum import Enum
+import liveness
+from liveness import get_next_use_distance
+from main import parse_function
 
 
 class CheckType(Enum):
@@ -602,6 +605,84 @@ class RegPressureError:
     variable: Optional[str] = None
 
 
+def is_variable_live(block_name: str, var: str, instr_idx: int, function, spill_function: SpillIRFunction) -> bool:
+    """
+    Check if a variable is live at a specific instruction point in a block.
+    
+    Args:
+        block_name: Name of the block in the spill IR
+        var: Variable name to check
+        instr_idx: Index of the instruction in the spill IR (0-based within the block)
+        function: The Function object with liveness information (from original IR)
+        spill_function: The SpillIRFunction object (to map block names)
+        
+    Returns:
+        True if variable is live at this point, False otherwise
+    """
+    # Find the corresponding block in the original IR
+    # Block names should match between spill IR and original IR
+    if block_name not in function.blocks:
+        # If block not found, assume variable is live (conservative)
+        return True
+    
+    block = function.blocks[block_name]
+    
+    # Map instruction index from spill IR to original IR
+    # Count only non-spill/reload instructions up to instr_idx
+    if block_name not in spill_function.blocks:
+        # If spill block not found, assume variable is live (conservative)
+        return True
+    
+    spill_block = spill_function.blocks[block_name]
+    original_instr_idx = 0
+    for i in range(min(instr_idx, len(spill_block.instructions))):
+        spill_instr = spill_block.instructions[i]
+        # Only count op, jmp, and phi instructions (skip spill/reload)
+        if spill_instr.kind in ("op", "jmp", "phi"):
+            original_instr_idx += 1
+    
+    # Check if variable is live-out (needed for successor blocks)
+    if isinstance(block.live_out, dict):
+        if var in block.live_out:
+            return True
+    elif isinstance(block.live_out, set):
+        if var in block.live_out:
+            return True
+    
+    # Check next-use distance - if finite, variable is live
+    # Use the mapped instruction index from original IR
+    next_use_dist = get_next_use_distance(block, var, original_instr_idx, function)
+    if next_use_dist != float('inf'):
+        return True
+    
+    # Variable is not live-out and has no finite next use - it's dead
+    return False
+
+
+def remove_dead_variables_from_r(state: RegisterState, block_name: str, instr_idx: int, 
+                                 function, spill_function: SpillIRFunction) -> None:
+    """
+    Remove dead variables from R set based on liveness analysis.
+    
+    Args:
+        state: The RegisterState to update
+        block_name: Name of the current block
+        instr_idx: Index of the current instruction
+        function: The Function object with liveness information (None if not available)
+        spill_function: The SpillIRFunction object
+    """
+    if function is None:
+        # No liveness information available, skip
+        return
+    
+    # Create a copy of R to iterate over (since we'll be modifying it)
+    vars_to_check = list(state.R)
+    for var in vars_to_check:
+        if not is_variable_live(block_name, var, instr_idx, function, spill_function):
+            # Variable is dead, remove it from R
+            state.R.discard(var)
+
+
 def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> Tuple[bool, List[RegPressureError], List[str]]:
     """
     Verify register pressure by simulating R and S sets through the program.
@@ -616,6 +697,26 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
         Tuple of (success, list of errors, annotated IR lines)
     """
     errors: List[RegPressureError] = []
+    
+    # Parse the original IR file to get liveness information
+    original_function = None
+    try:
+        with open(file_name, "r") as f:
+            ir_content = f.read()
+        # Filter out CHECK directives and comments
+        lines = ir_content.splitlines()
+        filtered_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped.startswith(";") and not re.match(r'\s*;\s*CHECK-', line):
+                filtered_lines.append(line)
+        ir_text = "\n".join(filtered_lines)
+        original_function = parse_function(ir_text)
+        liveness.compute_liveness(original_function)
+    except Exception:
+        # If we can't parse the original IR, continue without liveness checking
+        # (fallback to original behavior)
+        pass
     
     # Parse the SPILL IR
     try:
@@ -688,7 +789,7 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
         
         # Process each instruction in the block
         found_error = False
-        for instr in block.instructions:
+        for instr_idx, instr in enumerate(block.instructions):
             if found_error:
                 break
                 
@@ -779,6 +880,9 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                     break
                 
                 # Check register pressure: would reload exceed k?
+                # First, remove any dead variables from R
+                remove_dead_variables_from_r(state, block_name, instr_idx, original_function, function)
+                
                 if len(state.R) >= k:
                     # Compute eviction candidates: variables in R that are also in S
                     eviction_candidates = state.R & state.S
@@ -861,6 +965,9 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                                 active_events.remove(event)
                     
                     # Check register pressure before adding
+                    # First, remove any dead variables from R
+                    remove_dead_variables_from_r(state, block_name, instr_idx, original_function, function)
+                    
                     if def_var not in state.R and len(state.R) >= k:
                         # Need to spill something, but this is an error condition
                         # (the algorithm should have spilled before this point)
@@ -889,6 +996,10 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                             # If all candidates were resolved, remove event
                             if not event.candidates:
                                 active_events.remove(event)
+                    
+                    # Check register pressure before adding
+                    # First, remove any dead variables from R
+                    remove_dead_variables_from_r(state, block_name, instr_idx, original_function, function)
                     
                     if def_var not in state.R and len(state.R) >= k:
                         errors.append(RegPressureError(
@@ -973,7 +1084,7 @@ def main():
                         help="Update CHECK directives in IR file based on current output")
     parser.add_argument("--verify", action="store_true", default=True,
                         help="Verify output against CHECK directives (default)")
-    parser.add_argument("--verify-reg-pressure", action="store_true",
+    parser.add_argument("--verify-reg-pressure", action="store_true",default=True,
                         help="Verify register pressure by simulating R/S state through the program")
     
     args = parser.parse_args()
