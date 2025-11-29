@@ -473,21 +473,18 @@ def main():
         
         success, errors, warnings = verify_checks(checks, sections, args.registers, args.file)
         
-        # Display warnings about missing checks
-        if warnings:
-            print(f"{args.file}: Warning: Missing CHECK directives detected:", file=sys.stderr)
-            for warning in warnings:
-                print(f"  {warning}", file=sys.stderr)
-            print("", file=sys.stderr)
-        
         if success:
-            if warnings:
-                print(f"{args.file}: All CHECK directives passed, but some patterns in output lack CHECK directives.")
-                sys.exit(0)
-            else:
-                print(f"{args.file}: All CHECK directives passed!")
-                sys.exit(0)
+            # Only exit silently on success - no output
+            sys.exit(0)
         else:
+            # Only print when checks fail
+            # Display warnings about missing checks (only if there are also errors)
+            if warnings:
+                print(f"{args.file}: Warning: Missing CHECK directives detected:", file=sys.stderr)
+                for warning in warnings:
+                    print(f"  {warning}", file=sys.stderr)
+                print("", file=sys.stderr)
+            
             print(f"{args.file}: CHECK directive verification failed:", file=sys.stderr)
             for error in errors:
                 print(f"  {error}", file=sys.stderr)
