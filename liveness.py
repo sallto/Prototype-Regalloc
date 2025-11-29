@@ -922,12 +922,8 @@ def compute_block_next_use_distances(function: Function) -> None:
     # Build loop forest and identify loop edges (needed for postorder traversal)
     loop_forest, loop_edges, loop_membership = build_loop_forest(function)
     exit_edges = compute_loop_exit_edges(loop_membership, function)
-    print("loop_edges", loop_edges)
     # Get postorder traversal of blocks
     postorder = postorder_traversal_reduced_cfg(function, loop_edges)
-
-    print("exit_edges", exit_edges)
-    print("postorder", postorder)
     for block_name in postorder:
         block = function.blocks[block_name]
         # Compute live_out as the merged live_in from all successors, taking minimums
@@ -965,25 +961,38 @@ def compute_block_next_use_distances(function: Function) -> None:
 
         function.blocks[block_name].live_out = live_out
 
+        # Initialize per-value use position collection (will be converted to next_use_distances_by_val after propagation)
+        if not hasattr(block, '_value_uses_temp'):
+            block._value_uses_temp = {}
+        value_uses: Dict[str, List[int]] = block._value_uses_temp
+
         block_len = len(function.blocks[block_name].instructions)
         i = block_len
         for instr in reversed(function.blocks[block_name].instructions):
             i -= 1
             if isinstance(instr, Op):
                 for use in instr.uses:
-                    if use not in function.blocks[block_name].live_in:
-                        continue
-                    function.blocks[block_name].live_in[use] = min(
-                        function.blocks[block_name].live_in[use], i
-                    )
+                    # Update live_in distance if variable is in live_in
+                    if use in function.blocks[block_name].live_in:
+                        function.blocks[block_name].live_in[use] = min(
+                            function.blocks[block_name].live_in[use], i
+                        )
+                    # Collect use positions for per-value analysis (all uses, not just live_in)
+                    if use not in value_uses:
+                        value_uses[use] = []
+                    value_uses[use].append(i)
             elif isinstance(instr, Phi):
                 for incoming in instr.incomings:
                     use = incoming.value
-                    if use not in function.blocks[block_name].live_in:
-                        continue
-                    function.blocks[block_name].live_in[use] = min(
-                        function.blocks[block_name].live_in[use], i
-                    )
+                    # Update live_in distance if variable is in live_in
+                    if use in function.blocks[block_name].live_in:
+                        function.blocks[block_name].live_in[use] = min(
+                            function.blocks[block_name].live_in[use], i
+                        )
+                    # Collect phi incoming values as uses (all uses, not just live_in)
+                    if use not in value_uses:
+                        value_uses[use] = []
+                    value_uses[use].append(i)
 
         for var, dist in function.blocks[block_name].live_in.items():
             if (
@@ -994,68 +1003,6 @@ def compute_block_next_use_distances(function: Function) -> None:
                     block_name
                 ].live_out[var] + block_len
 
-
-
-def compute_per_value_next_use_distances(function: Function) -> None:
-    """
-    Compute next-use distances for every value within each block.
-    For each value, stores a list of instruction indices (distances from block start)
-    where the value is used. The list is sorted in chronological order.
-
-    Args:
-        function: The Function object to analyze
-    """
-    for block in function.blocks.values():
-        # Initialize the next_use_distances_by_val dict
-        block.next_use_distances_by_val = {}
-
-        # Collect all uses of each value throughout the block
-        # Map from variable name to list of instruction indices where it's used
-        value_uses: Dict[str, List[int]] = {}
-
-        # Walk instructions in forward order to collect use positions
-        for i in range(len(block.instructions)):
-            instr = block.instructions[i]
-
-            if isinstance(instr, Op):
-                # Record uses at this instruction index
-                for use in instr.uses:
-                    if use not in value_uses:
-                        value_uses[use] = []
-                    value_uses[use].append(i)
-            elif isinstance(instr, Phi):
-                # Record phi incoming values as uses
-                for incoming in instr.incomings:
-                    if incoming.value not in value_uses:
-                        value_uses[incoming.value] = []
-                    value_uses[incoming.value].append(i)
-
-        # Convert variable names to val_idx and store in block.next_use_distances_by_val
-        block_len = len(block.instructions)
-        for var, use_positions in value_uses.items():
-            if var in function.value_indices:
-                val_idx = function.value_indices[var]
-                # Store sorted list of use positions (distances from block start)
-                sorted_positions = sorted(use_positions)
-                # Add liveout distance as the last entry
-                if isinstance(block.live_out, dict) and var in block.live_out:
-                    # live_out[var] is distance from block exit, so add block_len to get distance from start
-                    sorted_positions.append(block_len + block.live_out[var])
-                else:
-                    # Not live out, append infinity as the last entry
-                    sorted_positions.append(math.inf)
-                block.next_use_distances_by_val[val_idx] = sorted_positions
-        
-        # Handle variables that are in live_out but didn't appear in value_uses
-        if isinstance(block.live_out, dict):
-            for var in block.live_out:
-                if var in function.value_indices:
-                    val_idx = function.value_indices[var]
-                    # Only add if not already processed above
-                    if val_idx not in block.next_use_distances_by_val:
-                        # Variable is live out but has no uses in this block
-                        # Add liveout distance as the only entry
-                        block.next_use_distances_by_val[val_idx] = [block_len + block.live_out[var]]
 
 
 def compute_liveness(function: Function) -> None:
@@ -1086,15 +1033,49 @@ def compute_liveness(function: Function) -> None:
             var: float("inf") for var in function.blocks[block_name].live_out
         }
 
-    # Phase 3: Compute next-use distances
+    # Phase 3: Compute next-use distances (including per-value distances)
     compute_block_next_use_distances(function)
 
     # Phase 4: Propagate next-use distances within loops
     propagate_next_use_distances(function, loop_forest, loop_membership, loop_edges)
 
-    # Phase 5: Compute per-value next-use distances within each block
-    compute_per_value_next_use_distances(function)
+    # Convert collected use positions to next_use_distances_by_val using final live_out values
+    for block in function.blocks.values():
+        block.next_use_distances_by_val = {}
+        if not hasattr(block, '_value_uses_temp'):
+            continue
+        value_uses = block._value_uses_temp
+        block_len = len(block.instructions)
+        
+        # Convert variable names to val_idx and store in block.next_use_distances_by_val
+        for var, use_positions in value_uses.items():
+            if var in function.value_indices:
+                val_idx = function.value_indices[var]
+                # Sort to get chronological order (since we collected in reverse)
+                sorted_positions = sorted(use_positions)
+                # Add liveout distance as the last entry (using final live_out values after propagation)
+                if isinstance(block.live_out, dict) and var in block.live_out:
+                    # live_out[var] is distance from block exit, so add block_len to get distance from start
+                    sorted_positions.append(block_len + block.live_out[var])
+                else:
+                    # Not live out, append infinity as the last entry
+                    sorted_positions.append(math.inf)
+                block.next_use_distances_by_val[val_idx] = sorted_positions
+        
+        # Handle variables that are in live_out but didn't appear in value_uses
+        if isinstance(block.live_out, dict):
+            for var in block.live_out:
+                if var in function.value_indices:
+                    val_idx = function.value_indices[var]
+                    # Only add if not already processed above
+                    if val_idx not in block.next_use_distances_by_val:
+                        # Variable is live out but has no uses in this block
+                        # Add liveout distance as the only entry
+                        block.next_use_distances_by_val[val_idx] = [block_len + block.live_out[var]]
+        
+        # Clean up temporary storage
+        delattr(block, '_value_uses_temp')
 
-    # Phase 6: Compute register pressure for all blocks
+    # Phase 5: Compute register pressure for all blocks
     for block in function.blocks.values():
         block.max_register_pressure = compute_register_pressure(block, function)
