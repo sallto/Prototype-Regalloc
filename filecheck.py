@@ -11,8 +11,8 @@ import re
 import subprocess
 import sys
 import argparse
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional, Set
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -32,6 +32,49 @@ class CheckDirective:
     k: Optional[int]  # Number of registers (None if not specified)
     line_number: int  # Line number in IR file where this check appears
     original_line: str  # Original line from IR file
+
+
+@dataclass
+class SpillIRInstruction:
+    """Represents an instruction in the SPILL IR."""
+    kind: str  # "op", "spill", "reload", "jmp", "phi"
+    uses: List[str] = field(default_factory=list)
+    defs: List[str] = field(default_factory=list)
+    variable: Optional[str] = None  # For spill/reload
+    targets: List[str] = field(default_factory=list)  # For jmp
+    line_number: int = 0  # Original line number in output
+
+
+@dataclass
+class SpillIRBlock:
+    """Represents a block in the SPILL IR."""
+    name: str
+    instructions: List[SpillIRInstruction] = field(default_factory=list)
+    successors: List[str] = field(default_factory=list)
+    predecessors: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SpillIRFunction:
+    """Represents a function parsed from SPILL section."""
+    name: str
+    blocks: Dict[str, SpillIRBlock] = field(default_factory=dict)
+
+
+@dataclass
+class RegisterState:
+    """Represents register and spill state at a program point."""
+    R: Set[str] = field(default_factory=set)  # Variables in registers
+    S: Set[str] = field(default_factory=set)  # Variables in spill slots
+
+
+@dataclass
+class EvictionEvent:
+    """Tracks a deferred eviction event where we're uncertain which variable was evicted."""
+    candidates: Set[str]  # Variables that could have been evicted (R ∩ S)
+    reload_var: str       # The variable being reloaded that triggered this
+    line_number: int      # Line number for error reporting
+    block_name: str       # Block name for error reporting
 
 
 def parse_checks(ir_content: str) -> Dict[CheckType, List[CheckDirective]]:
@@ -74,6 +117,111 @@ def parse_checks(ir_content: str) -> Dict[CheckType, List[CheckDirective]]:
                 checks[check_type].append(directive)
     
     return checks
+
+
+def parse_spill_ir(spill_lines: List[str]) -> SpillIRFunction:
+    """
+    Parse SPILL section IR into structured data.
+    
+    Args:
+        spill_lines: List of lines from the SPILL section
+        
+    Returns:
+        SpillIRFunction object with parsed blocks and instructions
+    """
+    function = None
+    current_block = None
+    line_num = 0
+    
+    for line in spill_lines:
+        line_num += 1
+        stripped = line.strip()
+        
+        # Skip empty lines
+        if not stripped:
+            continue
+        
+        # Parse function header
+        if stripped.startswith("function "):
+            func_name = stripped[len("function "):].strip()
+            function = SpillIRFunction(name=func_name)
+            continue
+        
+        # Parse block header
+        if stripped.startswith("block ") and stripped.endswith(":"):
+            block_name = stripped[len("block "):-1].strip()
+            if function is None:
+                raise ValueError(f"Block '{block_name}' found before function declaration")
+            current_block = SpillIRBlock(name=block_name)
+            function.blocks[block_name] = current_block
+            continue
+        
+        # Parse instructions (must be indented with 2 spaces)
+        if line.startswith("  ") and not line.startswith("   "):
+            if current_block is None:
+                continue  # Skip instructions outside blocks
+            
+            instr_line = line[2:].strip()  # Remove 2-space indent
+            
+            # Parse spill instruction
+            if instr_line.startswith("spill "):
+                var = instr_line[len("spill "):].strip()
+                current_block.instructions.append(
+                    SpillIRInstruction(kind="spill", variable=var, line_number=line_num)
+                )
+            # Parse reload instruction
+            elif instr_line.startswith("reload "):
+                var_part = instr_line[len("reload "):].strip()
+                # Handle "reload %vX -> rN" format (ignore color info)
+                var = var_part.split("->")[0].strip()
+                current_block.instructions.append(
+                    SpillIRInstruction(kind="reload", variable=var, line_number=line_num)
+                )
+            # Parse op instruction
+            elif instr_line.startswith("op "):
+                uses = []
+                defs = []
+                parts = instr_line[len("op "):].split()
+                for part in parts:
+                    if part.startswith("uses="):
+                        uses_str = part[len("uses="):]
+                        if uses_str:
+                            uses = uses_str.split(",")
+                    elif part.startswith("defs="):
+                        defs_str = part[len("defs="):]
+                        if defs_str:
+                            defs = defs_str.split(",")
+                current_block.instructions.append(
+                    SpillIRInstruction(kind="op", uses=uses, defs=defs, line_number=line_num)
+                )
+            # Parse jmp instruction
+            elif instr_line.startswith("jmp "):
+                targets_str = instr_line[len("jmp "):].strip()
+                targets = targets_str.split(",") if targets_str else []
+                current_block.instructions.append(
+                    SpillIRInstruction(kind="jmp", targets=targets, line_number=line_num)
+                )
+                # Update block successors
+                current_block.successors = targets
+            # Parse phi instruction (if present)
+            elif instr_line.startswith("phi "):
+                # For now, just record it as a phi - we may need to parse incomings later
+                parts = instr_line.split()
+                if len(parts) >= 2:
+                    dest = parts[1]
+                    current_block.instructions.append(
+                        SpillIRInstruction(kind="phi", defs=[dest], line_number=line_num)
+                    )
+    
+    # Build predecessor lists
+    if function:
+        for block_name, block in function.blocks.items():
+            for succ_name in block.successors:
+                if succ_name in function.blocks:
+                    if block_name not in function.blocks[succ_name].predecessors:
+                        function.blocks[succ_name].predecessors.append(block_name)
+    
+    return function if function else SpillIRFunction(name="")
 
 
 def parse_output_sections(output: str) -> Dict[CheckType, List[str]]:
@@ -402,6 +550,402 @@ def generate_checks(sections: Dict[CheckType, List[str]],
     return "\n".join(result_lines)
 
 
+def topological_order_spill_ir(function: SpillIRFunction) -> List[str]:
+    """
+    Return blocks in topological order (predecessors before successors).
+    
+    Args:
+        function: The SpillIRFunction object
+        
+    Returns:
+        List of block names in topological order
+    """
+    # Find entry blocks (blocks with no predecessors)
+    entry_blocks = [name for name, block in function.blocks.items() if not block.predecessors]
+    
+    # If no blocks have predecessors, pick the first block as entry
+    if not entry_blocks:
+        entry_blocks = [list(function.blocks.keys())[0]] if function.blocks else []
+    
+    visited = set()
+    order = []
+    
+    def dfs(block_name: str):
+        if block_name in visited:
+            return
+        visited.add(block_name)
+        
+        # Visit all successors
+        block = function.blocks.get(block_name)
+        if block:
+            for successor in block.successors:
+                if successor in function.blocks:
+                    dfs(successor)
+        
+        order.append(block_name)
+    
+    # Start DFS from each entry block
+    for entry in entry_blocks:
+        dfs(entry)
+    
+    # Reverse to get topological order (predecessors first)
+    return order[::-1]
+
+
+@dataclass
+class RegPressureError:
+    """Represents a register pressure error."""
+    error_type: str
+    message: str
+    block_name: str
+    line_number: int
+    variable: Optional[str] = None
+
+
+def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> Tuple[bool, List[RegPressureError], List[str]]:
+    """
+    Verify register pressure by simulating R and S sets through the program.
+    Stops at the first error found.
+    
+    Args:
+        spill_lines: List of lines from the SPILL section
+        k: Number of available registers
+        file_name: Name of the file being checked (for error messages)
+        
+    Returns:
+        Tuple of (success, list of errors, annotated IR lines)
+    """
+    errors: List[RegPressureError] = []
+    
+    # Parse the SPILL IR
+    try:
+        function = parse_spill_ir(spill_lines)
+    except Exception as e:
+        errors.append(RegPressureError(
+            error_type="PARSE_ERROR",
+            message=f"Failed to parse SPILL IR: {e}",
+            block_name="",
+            line_number=0
+        ))
+        return False, errors, spill_lines
+    
+    if not function.blocks:
+        errors.append(RegPressureError(
+            error_type="NO_BLOCKS",
+            message="No blocks found in SPILL IR",
+            block_name="",
+            line_number=0
+        ))
+        return False, errors, spill_lines
+    
+    # Track final state of each block
+    block_final_states: Dict[str, RegisterState] = {}
+    
+    # Track active eviction events across blocks (persist until resolved)
+    active_events: List[EvictionEvent] = []
+    
+    # Process blocks in topological order
+    block_order = topological_order_spill_ir(function)
+    
+    for block_name in block_order:
+        block = function.blocks[block_name]
+        
+        # Initialize register state for this block entry
+        state = RegisterState()
+        
+        if not block.predecessors:
+            # Entry block: start with empty registers and spill slots
+            state.R = set()
+            state.S = set()
+        else:
+            # Non-entry block: merge states from all predecessors
+            # S_entry = intersection of all predecessor S sets (only reliably spilled on ALL paths)
+            pred_states = [block_final_states[pred] for pred in block.predecessors if pred in block_final_states]
+            
+            if pred_states:
+                # S is intersection: variable must be spilled on ALL paths
+                state.S = set.intersection(*[s.S for s in pred_states]) if pred_states else set()
+                
+                # R is intersection: variable must be in register on ALL paths
+                # But we need to be careful - if a variable is in R in one pred but not another,
+                # it's not reliably in R at entry
+                state.R = set.intersection(*[s.R for s in pred_states]) if pred_states else set()
+            else:
+                # No predecessor states available (shouldn't happen, but handle gracefully)
+                state.R = set()
+                state.S = set()
+        
+        # Filter active events at block entry: update candidates based on current state
+        # At merge points, candidates that are not in R ∩ S were evicted in at least one path
+        # We keep tracking them until we see them used or reloaded to determine which was evicted
+        for event in active_events[:]:
+            # Update candidates: only keep those still possible (in R ∩ S at entry)
+            # If a candidate is not in R ∩ S, it was evicted or used/spilled in all paths
+            event.candidates &= (state.R & state.S)
+            # If all candidates were removed, the event is resolved (all were evicted)
+            if not event.candidates:
+                active_events.remove(event)
+        
+        # Process each instruction in the block
+        found_error = False
+        for instr in block.instructions:
+            if found_error:
+                break
+                
+            if instr.kind == "spill":
+                var = instr.variable
+                if var is None:
+                    continue
+                
+                # Check if spilling this variable resolves an eviction event
+                # (if this var was a candidate, spilling it confirms it wasn't evicted earlier)
+                for event in active_events[:]:
+                    if var in event.candidates:
+                        # This var was spilled, so it wasn't the evicted one - remove from candidates
+                        event.candidates.discard(var)
+                        # If all candidates were resolved (spilled or reloaded), remove event
+                        if not event.candidates:
+                            active_events.remove(event)
+                
+                # Error: Spilling variable not in registers
+                if var not in state.R:
+                    errors.append(RegPressureError(
+                        error_type="SPILL_NOT_IN_REGISTER",
+                        message=f"spill {var} but {var} is not in registers (R={sorted(state.R)}, S={sorted(state.S)})",
+                        block_name=block_name,
+                        line_number=instr.line_number,
+                        variable=var
+                    ))
+                    found_error = True
+                    break
+                
+                # Error: Double-spill (variable already in S)
+                if var in state.S:
+                    errors.append(RegPressureError(
+                        error_type="DOUBLE_SPILL",
+                        message=f"spill {var} but {var} is already spilled (R={sorted(state.R)}, S={sorted(state.S)})",
+                        block_name=block_name,
+                        line_number=instr.line_number,
+                        variable=var
+                    ))
+                    found_error = True
+                    break
+                
+                # Perform spill: remove from R, add to S
+                state.R.discard(var)
+                state.S.add(var)
+                
+            elif instr.kind == "reload":
+                var = instr.variable
+                if var is None:
+                    continue
+                
+                # Error: Reloading variable not in S (not spilled on all paths)
+                if var not in state.S:
+                    errors.append(RegPressureError(
+                        error_type="RELOAD_WITHOUT_SPILL",
+                        message=f"reload {var} but {var} is not in spill slots (R={sorted(state.R)}, S={sorted(state.S)})",
+                        block_name=block_name,
+                        line_number=instr.line_number,
+                        variable=var
+                    ))
+                    found_error = True
+                    break
+                
+                # Check if reloading this variable resolves an eviction event
+                # (if this var was a candidate in an event, it confirms it was the evicted one)
+                event_to_remove = None
+                for event in active_events:
+                    if var in event.candidates:
+                        # This confirms var was the evicted one - resolve the event
+                        event_to_remove = event
+                        # Remove var from R (it was optimistically kept in R, but was actually evicted)
+                        state.R.discard(var)
+                        break
+                
+                if event_to_remove:
+                    active_events.remove(event_to_remove)
+                
+                # Error: Double-reload (variable already in R, and not resolving an event)
+                if var in state.R:
+                    errors.append(RegPressureError(
+                        error_type="DOUBLE_RELOAD",
+                        message=f"reload {var} but {var} is already in registers (R={sorted(state.R)}, S={sorted(state.S)})",
+                        block_name=block_name,
+                        line_number=instr.line_number,
+                        variable=var
+                    ))
+                    found_error = True
+                    break
+                
+                # Check register pressure: would reload exceed k?
+                if len(state.R) >= k:
+                    # Compute eviction candidates: variables in R that are also in S
+                    eviction_candidates = state.R & state.S
+                    
+                    if not eviction_candidates:
+                        # No silently-evictable candidates - immediate error
+                        errors.append(RegPressureError(
+                            error_type="REGISTER_PRESSURE_EXCEEDED",
+                            message=f"reload {var} would exceed register limit k={k}, no silently-evictable candidates (R={sorted(state.R)}, S={sorted(state.S)}, |R|={len(state.R)})",
+                            block_name=block_name,
+                            line_number=instr.line_number,
+                            variable=var
+                        ))
+                        found_error = True
+                        break
+                    else:
+                        # Create eviction event: track which variables could have been evicted
+                        event = EvictionEvent(
+                            candidates=eviction_candidates.copy(),
+                            reload_var=var,
+                            line_number=instr.line_number,
+                            block_name=block_name
+                        )
+                        active_events.append(event)
+                        # Optimistically assume all candidates still in R (we'll track usage)
+                        # Add reloaded var to R
+                        state.R.add(var)
+                else:
+                    # No register pressure - just add to R
+                    state.R.add(var)
+                
+            elif instr.kind == "op":
+                # Check uses: all used variables must be in registers
+                for use_var in instr.uses:
+                    # Check if this use affects any active eviction events
+                    for event in active_events:
+                        if use_var in event.candidates:
+                            # Remove from candidates (this var was used, so it wasn't evicted)
+                            event.candidates.discard(use_var)
+                            # If all candidates were used, error: one must have been evicted
+                            if not event.candidates:
+                                errors.append(RegPressureError(
+                                    error_type="USE_WITHOUT_REGISTER",
+                                    message=f"op uses {use_var} but all eviction candidates from reload {event.reload_var} at {event.block_name}:{event.line_number} were used - one must have been evicted but was used without reload (R={sorted(state.R)}, S={sorted(state.S)})",
+                                    block_name=block_name,
+                                    line_number=instr.line_number,
+                                    variable=use_var
+                                ))
+                                found_error = True
+                                break
+                    
+                    if found_error:
+                        break
+                    
+                    # Check if variable is in registers (after accounting for eviction events)
+                    if use_var not in state.R:
+                        errors.append(RegPressureError(
+                            error_type="USE_WITHOUT_REGISTER",
+                            message=f"op uses {use_var} but {use_var} is not in registers (R={sorted(state.R)}, S={sorted(state.S)})",
+                            block_name=block_name,
+                            line_number=instr.line_number,
+                            variable=use_var
+                        ))
+                        found_error = True
+                        break
+                
+                if found_error:
+                    break
+                
+                # Process defs: add to registers
+                for def_var in instr.defs:
+                    # Check if defining this variable resolves an eviction event
+                    # (if this var was a candidate, defining it confirms it wasn't evicted)
+                    for event in active_events[:]:
+                        if def_var in event.candidates:
+                            # This var is being redefined, so it wasn't evicted - remove from candidates
+                            event.candidates.discard(def_var)
+                            # If all candidates were resolved, remove event
+                            if not event.candidates:
+                                active_events.remove(event)
+                    
+                    # Check register pressure before adding
+                    if def_var not in state.R and len(state.R) >= k:
+                        # Need to spill something, but this is an error condition
+                        # (the algorithm should have spilled before this point)
+                        errors.append(RegPressureError(
+                            error_type="REGISTER_PRESSURE_EXCEEDED",
+                            message=f"op defs {def_var} would exceed register limit k={k} (R={sorted(state.R)}, S={sorted(state.S)}, |R|={len(state.R)})",
+                            block_name=block_name,
+                            line_number=instr.line_number,
+                            variable=def_var
+                        ))
+                        found_error = True
+                        break
+                    
+                    # Add to registers
+                    state.R.add(def_var)
+                    # Note: S only shrinks at block entry merges, not when variables are defined
+                
+            elif instr.kind == "phi":
+                # Phi defines a variable - similar to op defs
+                for def_var in instr.defs:
+                    # Check if defining this variable resolves an eviction event
+                    for event in active_events[:]:
+                        if def_var in event.candidates:
+                            # This var is being redefined, so it wasn't evicted - remove from candidates
+                            event.candidates.discard(def_var)
+                            # If all candidates were resolved, remove event
+                            if not event.candidates:
+                                active_events.remove(event)
+                    
+                    if def_var not in state.R and len(state.R) >= k:
+                        errors.append(RegPressureError(
+                            error_type="REGISTER_PRESSURE_EXCEEDED",
+                            message=f"phi defs {def_var} would exceed register limit k={k} (R={sorted(state.R)}, S={sorted(state.S)}, |R|={len(state.R)})",
+                            block_name=block_name,
+                            line_number=instr.line_number,
+                            variable=def_var
+                        ))
+                        found_error = True
+                        break
+                    
+                    state.R.add(def_var)
+                    # Note: S only shrinks at block entry merges, not when variables are defined
+        
+        # If we found an error, stop processing blocks
+        if found_error:
+            break
+        
+        # Store final state for this block
+        block_final_states[block_name] = RegisterState(
+            R=state.R.copy(),
+            S=state.S.copy()
+        )
+    
+    return len(errors) == 0, errors, spill_lines
+
+
+def print_ir_with_errors(spill_lines: List[str], errors: List[RegPressureError]) -> None:
+    """
+    Print the IR with errors annotated inline where they occurred.
+    
+    Args:
+        spill_lines: List of lines from the SPILL section
+        errors: List of errors found (should have at least one)
+    """
+    if not errors:
+        return
+    
+    # Create mapping of line number to error
+    error_by_line: Dict[int, RegPressureError] = {}
+    for error in errors:
+        if error.line_number > 0:
+            error_by_line[error.line_number] = error
+    
+    # Print the IR with error annotations
+    for line_num, line in enumerate(spill_lines, start=1):
+        if line_num in error_by_line:
+            error = error_by_line[line_num]
+            # Print the line with error annotation
+            stripped = line.rstrip()
+            # Add error annotation as a comment
+            print(f"{stripped}  # ERROR: {error.error_type}: {error.message}", file=sys.stderr)
+        else:
+            print(line, file=sys.stderr)
+
+
 def run_main_program(ir_file: str, k: int) -> str:
     """Run main.py and capture its output."""
     try:
@@ -429,6 +973,8 @@ def main():
                         help="Update CHECK directives in IR file based on current output")
     parser.add_argument("--verify", action="store_true", default=True,
                         help="Verify output against CHECK directives (default)")
+    parser.add_argument("--verify-reg-pressure", action="store_true",
+                        help="Verify register pressure by simulating R/S state through the program")
     
     args = parser.parse_args()
     
@@ -445,6 +991,26 @@ def main():
     
     # Parse output sections
     sections = parse_output_sections(output)
+    
+    # Handle register pressure verification mode
+    if args.verify_reg_pressure:
+        spill_lines = sections.get(CheckType.SPILL, [])
+        if not spill_lines:
+            print(f"{args.file}: Error: No SPILL section found in output", file=sys.stderr)
+            sys.exit(1)
+        
+        success, errors, annotated_lines = verify_register_pressure(spill_lines, args.registers, args.file)
+        
+        if success:
+            print(f"{args.file}: Register pressure verification passed!")
+            sys.exit(0)
+        else:
+            print(f"{args.file}: Register pressure verification failed:", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("IR with errors:", file=sys.stderr)
+            print("=" * 70, file=sys.stderr)
+            print_ir_with_errors(annotated_lines, errors)
+            sys.exit(1)
     
     if args.update:
         # Update mode: generate CHECK directives
