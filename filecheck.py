@@ -641,7 +641,14 @@ def is_variable_live(block_name: str, var: str, instr_idx: int, function, spill_
         if spill_instr.kind in ("op", "jmp", "phi"):
             original_instr_idx += 1
     
+    # Check next-use distance first - if finite, variable is live at this point
+    # Use the mapped instruction index from original IR
+    next_use_dist = get_next_use_distance(block, var, original_instr_idx, function)
+    if next_use_dist != float('inf'):
+        return True
+    
     # Check if variable is live-out (needed for successor blocks)
+    # This is important even if next-use distance is infinite (variable might be needed later)
     if isinstance(block.live_out, dict):
         if var in block.live_out:
             return True
@@ -649,13 +656,7 @@ def is_variable_live(block_name: str, var: str, instr_idx: int, function, spill_
         if var in block.live_out:
             return True
     
-    # Check next-use distance - if finite, variable is live
-    # Use the mapped instruction index from original IR
-    next_use_dist = get_next_use_distance(block, var, original_instr_idx, function)
-    if next_use_dist != float('inf'):
-        return True
-    
-    # Variable is not live-out and has no finite next use - it's dead
+    # Variable has no finite next use and is not live-out - it's dead
     return False
 
 
@@ -667,7 +668,7 @@ def remove_dead_variables_from_r(state: RegisterState, block_name: str, instr_id
     Args:
         state: The RegisterState to update
         block_name: Name of the current block
-        instr_idx: Index of the current instruction
+        instr_idx: Index of the current instruction (0 = block entry)
         function: The Function object with liveness information (None if not available)
         spill_function: The SpillIRFunction object
     """
@@ -675,10 +676,170 @@ def remove_dead_variables_from_r(state: RegisterState, block_name: str, instr_id
         # No liveness information available, skip
         return
     
+    if block_name not in function.blocks:
+        # Block not found in original IR, skip
+        return
+    
+    block = function.blocks[block_name]
+    
     # Create a copy of R to iterate over (since we'll be modifying it)
     vars_to_check = list(state.R)
     for var in vars_to_check:
-        if not is_variable_live(block_name, var, instr_idx, function, spill_function):
+        # Check if variable is used anywhere in the current block
+        # (not just in use_set, which only includes uses before defs)
+        used_in_block = var in block.use_set or var in block.phi_uses
+        if not used_in_block:
+            # Check all instructions to see if variable is used anywhere
+            for instr in block.instructions:
+                if hasattr(instr, 'uses') and var in instr.uses:
+                    used_in_block = True
+                    break
+                # Also check phi incomings from this block
+                if hasattr(instr, 'incomings'):
+                    for incoming in instr.incomings:
+                        if incoming.block == block_name and incoming.value == var:
+                            used_in_block = True
+                            break
+                    if used_in_block:
+                        break
+        
+        # Also check if variable is defined in this block - if so, it can't be evicted
+        # if it's used after definition (even if not in use_set)
+        defined_in_block = var in block.def_set or var in block.phi_defs
+        if defined_in_block:
+            # Variable is defined in this block - check if it's used after definition
+            found_def = False
+            for instr in block.instructions:
+                # Check for def
+                if hasattr(instr, 'defs') and var in instr.defs:
+                    found_def = True
+                elif hasattr(instr, 'dest') and instr.dest == var:  # Phi
+                    found_def = True
+                # Check for use after def
+                if found_def:
+                    if hasattr(instr, 'uses') and var in instr.uses:
+                        used_in_block = True
+                        break
+            # If variable is defined in this block, don't evict it even if not used
+            # (it might be used later in the same block, and we're checking at an early point)
+            if not used_in_block:
+                # Still mark as used to prevent eviction - variables defined in block
+                # should stay in R until we're sure they're not needed
+                used_in_block = True
+        
+        # Check if variable is used as a phi input in any successor block
+        # If so, it can't be evicted because phis need their input values
+        used_as_phi_input = False
+        for succ_name in block.successors:
+            if succ_name not in function.blocks:
+                continue
+            succ_block = function.blocks[succ_name]
+            # Check if variable is used as a phi input from this block
+            for instr in succ_block.instructions:
+                if hasattr(instr, 'incomings'):
+                    for incoming in instr.incomings:
+                        if incoming.block == block_name and incoming.value == var:
+                            used_as_phi_input = True
+                            break
+                    if used_as_phi_input:
+                        break
+            if used_as_phi_input:
+                break
+        
+        # If variable is not used in current block and not used as phi input, check if it can be evicted
+        # A variable can be evicted if all paths from this block redefine it before use
+        if not used_in_block and not used_as_phi_input:
+            # Check if variable is redefined in all successor blocks before any use
+            can_evict = True
+            for succ_name in block.successors:
+                if succ_name not in function.blocks:
+                    can_evict = False
+                    break
+                succ_block = function.blocks[succ_name]
+                # Check if variable is redefined before use in successor
+                # Scan instructions to see if def comes before use
+                found_def = False
+                found_use_before_def = False
+                for instr in succ_block.instructions:
+                    # Check for use (excluding phi inputs, which we already checked)
+                    if hasattr(instr, 'uses') and var in instr.uses:
+                        if not found_def:
+                            found_use_before_def = True
+                            break
+                    # Check for def
+                    if hasattr(instr, 'defs') and var in instr.defs:
+                        found_def = True
+                    elif hasattr(instr, 'dest') and instr.dest == var:  # Phi
+                        found_def = True
+                
+                # If variable is used before being redefined, can't evict
+                if found_use_before_def:
+                    can_evict = False
+                    break
+                # If variable is not redefined in this successor, check if it flows to blocks that need it
+                if not found_def:
+                    # Variable flows through this successor - need to check if it's needed
+                    # For now, be conservative: if not redefined, assume it's needed
+                    can_evict = False
+                    break
+            
+            if can_evict:
+                # Variable can be evicted - remove it from R
+                state.R.discard(var)
+                continue
+        
+        # Variable is used in block or can't be evicted - check if it's live at this point
+        is_live = False
+        
+        # If variable is defined in this block, check if it's used at or after the current instruction
+        # Variables defined in the current block should stay in R if they're used later
+        if defined_in_block:
+            # Map instruction index to original IR
+            spill_block = spill_function.blocks[block_name]
+            original_instr_idx = 0
+            for i in range(min(instr_idx, len(spill_block.instructions))):
+                spill_instr = spill_block.instructions[i]
+                if spill_instr.kind in ("op", "jmp", "phi"):
+                    original_instr_idx += 1
+            
+            # Check if variable is used at or after this instruction in the original IR
+            for i in range(original_instr_idx, len(block.instructions)):
+                instr = block.instructions[i]
+                if hasattr(instr, 'uses') and var in instr.uses:
+                    is_live = True
+                    break
+            
+            # Also check if variable is live-out
+            if isinstance(block.live_out, dict):
+                if var in block.live_out:
+                    is_live = True
+            elif isinstance(block.live_out, set):
+                if var in block.live_out:
+                    is_live = True
+        else:
+            # Variable not defined in this block - use normal liveness check
+            # At block entry (instr_idx == 0), check live_in and live_out
+            if instr_idx == 0:
+                # Check live_in
+                if isinstance(block.live_in, dict):
+                    if var in block.live_in:
+                        is_live = True
+                elif isinstance(block.live_in, set):
+                    if var in block.live_in:
+                        is_live = True
+                
+                # Check live_out
+                if isinstance(block.live_out, dict):
+                    if var in block.live_out:
+                        is_live = True
+                elif isinstance(block.live_out, set):
+                    if var in block.live_out:
+                        is_live = True
+            else:
+                # For other instruction indices, use the full liveness check
+                is_live = is_variable_live(block_name, var, instr_idx, function, spill_function)
+        
+        if not is_live:
             # Variable is dead, remove it from R
             state.R.discard(var)
 
@@ -708,8 +869,12 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
         filtered_lines = []
         for line in lines:
             stripped = line.strip()
-            if not stripped.startswith(";") and not re.match(r'\s*;\s*CHECK-', line):
-                filtered_lines.append(line)
+            # Skip comment lines (starting with # or ;) and CHECK directives
+            if (stripped.startswith("#") or 
+                stripped.startswith(";") or 
+                re.match(r'\s*;\s*CHECK-', line)):
+                continue
+            filtered_lines.append(line)
         ir_text = "\n".join(filtered_lines)
         original_function = parse_function(ir_text)
         liveness.compute_liveness(original_function)
@@ -775,6 +940,10 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                 # No predecessor states available (shouldn't happen, but handle gracefully)
                 state.R = set()
                 state.S = set()
+        
+        # Remove dead variables from R at block entry
+        # This is important because variables from predecessors might be dead in this block
+        remove_dead_variables_from_r(state, block_name, 0, original_function, function)
         
         # Filter active events at block entry: update candidates based on current state
         # At merge points, candidates that are not in R ∩ S were evicted in at least one path
@@ -881,7 +1050,9 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                 
                 # Check register pressure: would reload exceed k?
                 # First, remove any dead variables from R
-                remove_dead_variables_from_r(state, block_name, instr_idx, original_function, function)
+                # Check liveness just before this instruction (after previous instructions have been processed)
+                check_idx = max(0, instr_idx - 1) if instr_idx > 0 else 0
+                remove_dead_variables_from_r(state, block_name, check_idx, original_function, function)
                 
                 if len(state.R) >= k:
                     # Compute eviction candidates: variables in R that are also in S
@@ -915,6 +1086,10 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                     state.R.add(var)
                 
             elif instr.kind == "op":
+                # Before processing uses, remove any dead variables from R
+                # This ensures we have accurate register pressure before checking uses
+                remove_dead_variables_from_r(state, block_name, instr_idx, original_function, function)
+                
                 # Check uses: all used variables must be in registers
                 for use_var in instr.uses:
                     # Check if this use affects any active eviction events
@@ -951,6 +1126,10 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                 
                 if found_error:
                     break
+                
+                # After processing uses, remove any dead variables from R
+                # Variables that were just used and are no longer live should be removed
+                remove_dead_variables_from_r(state, block_name, instr_idx + 1, original_function, function)
                 
                 # Process defs: add to registers
                 for def_var in instr.defs:
