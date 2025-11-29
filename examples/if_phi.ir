@@ -11,10 +11,6 @@ block b2:
 
 ; CHECK directives (auto-generated for k=3)
 
-
-
-; CHECK directives (auto-generated for k=3)
-
 ; CHECK-SPILL-K3 directives:
 ; CHECK-SPILL-K3: op defs=%v0
 ; CHECK-SPILL-K3: jmp b1,b2

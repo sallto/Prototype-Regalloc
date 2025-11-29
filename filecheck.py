@@ -509,11 +509,11 @@ def generate_checks(sections: Dict[CheckType, List[str]],
     # Remove existing CHECK directives from input
     filtered_lines = []
     for line in lines:
-        if not re.match(r'\s*;\s*CHECK-', line):
-            filtered_lines.append(line)
+        if  re.match(r'\s*;\s*CHECK', line):
+            break
+        filtered_lines.append(line)
     
     result_lines.extend(filtered_lines)
-    result_lines.append("")
     result_lines.append(f"; CHECK directives (auto-generated for k={k})")
     
     # Generate SPILL checks
@@ -1263,7 +1263,7 @@ def main():
                         help="Update CHECK directives in IR file based on current output")
     parser.add_argument("--verify", action="store_true", default=True,
                         help="Verify output against CHECK directives (default)")
-    parser.add_argument("--verify-reg-pressure", action="store_true",default=True,
+    parser.add_argument("--verify-reg-pressure", action="store_true",
                         help="Verify register pressure by simulating R/S state through the program")
     
     args = parser.parse_args()

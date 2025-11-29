@@ -26,14 +26,6 @@ block b3:
 
 ; CHECK directives (auto-generated for k=3)
 
-
-
-; CHECK directives (auto-generated for k=3)
-
-
-
-; CHECK directives (auto-generated for k=3)
-
 ; CHECK-SPILL-K3 directives:
 ; CHECK-SPILL-K3: op defs=%v0
 ; CHECK-SPILL-K3: op defs=%v1
@@ -54,8 +46,8 @@ block b3:
 ; CHECK-SPILL-K3: reload %v4
 ; CHECK-SPILL-K3: op uses=%v4
 ; CHECK-SPILL-K3: jmp b3
-; CHECK-SPILL-K3: jmp b3
 ; CHECK-SPILL-K3: reload %v4
+; CHECK-SPILL-K3: jmp b3
 ; CHECK-SPILL-K3: op uses=%v0
 ; CHECK-SPILL-K3: op uses=%v1
 ; CHECK-SPILL-K3: reload %v2
@@ -84,8 +76,8 @@ block b3:
 ; CHECK-COLOR-K3: reload %v4 -> r2
 ; CHECK-COLOR-K3: op uses=%v4
 ; CHECK-COLOR-K3: jmp b3
-; CHECK-COLOR-K3: jmp b3
 ; CHECK-COLOR-K3: reload %v4 -> r2
+; CHECK-COLOR-K3: jmp b3
 ; CHECK-COLOR-K3: op uses=%v0
 ; CHECK-COLOR-K3: op uses=%v1
 ; CHECK-COLOR-K3: reload %v2 -> r2

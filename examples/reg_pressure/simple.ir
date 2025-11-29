@@ -12,34 +12,6 @@ block b0:
   op uses=%v3
   op uses=%v4
 
-; Example CHECK directives demonstrating FileCheck functionality
-
-
-
-; CHECK directives (auto-generated)
-
-
-
-; CHECK directives (auto-generated)
-
-
-
-; CHECK directives (auto-generated for k=3)
-
-
-
-; CHECK directives (auto-generated for k=3)
-
-
-
-; CHECK directives (auto-generated for k=3)
-
-
-
-; CHECK directives (auto-generated for k=3)
-
-
-
 ; CHECK directives (auto-generated for k=3)
 
 ; CHECK-SPILL-K3 directives:
