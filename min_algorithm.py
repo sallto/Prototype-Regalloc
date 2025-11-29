@@ -347,6 +347,29 @@ def sortByNextUse(vars: Set[str], entry_instr_idx: int, block: Block) -> List[st
     return sorted(vars, key=get_next_use_dist)
 
 
+def is_variable_defined_at_position(block: Block, var: str, position: int) -> bool:
+    """
+    Check if a variable is defined at or before a given position in a block.
+    
+    Args:
+        block: The block to check
+        var: The variable name to check
+        position: Instruction index position (0 = first instruction)
+        
+    Returns:
+        True if the variable is defined at instruction index <= position, False otherwise
+    """
+    # Check instructions up to and including the position
+    for idx in range(min(position + 1, len(block.instructions))):
+        instr = block.instructions[idx]
+        if isinstance(instr, Op) and var in instr.defs:
+            return True
+        elif isinstance(instr, Phi) and instr.dest == var:
+            # Phi instructions are typically at the beginning of blocks (index 0)
+            return True
+    return False
+
+
 def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
                    function: Function, k: int) -> Tuple[Set[str], Set[str]]:
     """
@@ -500,7 +523,7 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             # But skip variables that are available from all predecessors (they don't need reloads)
             # Also skip phi incoming values that are already available from this specific predecessor
             # And skip phi incoming values that come from other predecessors (not needed from this edge)
-            reload_vars = ((W_entry - pred_W_exit) - block.phi_defs) - vars_available_from_all - phi_incoming_vars_from_pred - phi_incoming_vars_from_other_preds
+            reload_vars = ((W_entry - pred_W_exit) - block.phi_defs) - vars_available_from_all - phi_incoming_vars_from_pred - phi_incoming_vars_from_other_preds - block.def_set
             
             # Check if reloading would exceed k registers
             # After reloads, we'll have: pred_W_exit ∪ reload_vars
@@ -523,7 +546,7 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
                         insert_spill_reload_sorted(result[pred_name], SpillReload("spill", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
             
             for var in reload_vars:
-                insert_spill_reload_sorted(result[block_name], SpillReload("reload", var, 0, block_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+                insert_spill_reload_sorted(result[pred_name], SpillReload("reload", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
             # Spill: All variables in (S_entry \ S_exit_pred) ∩ W_exit_pred
             spill_vars = ((S_entry - pred_S_exit) & pred_W_exit) #| ((pred_W_exit - pred_S_exit - W_entry) & block.live_in.keys())
