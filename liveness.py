@@ -502,7 +502,8 @@ def compute_initial_liveness(
 
         # Compute live_out as the merged live_in from all successors, taking minimums
         # Start with phi_uses (values flowing into phis from this block)
-        live_out = {var: float("inf") for var in block.phi_uses}
+        # Phi uses happen at successor entry, so distance is 0 from block exit
+        live_out = {var: 0 for var in block.phi_uses}
         
         for succ in block.successors:
             if succ in function.blocks:
@@ -536,14 +537,10 @@ def compute_initial_liveness(
         block.live_out = live_out
 
         # LiveIn(B) = (LiveOut(B) - DEF(B)) ∪ USE(B)
-        # Start with live_out, excluding def_set keys
-        block.live_in = {var: val for var, val in block.live_out.items() if var not in block.def_set}
+        # Start with live_out, excluding def_set and phi_defs keys
+        block.live_in = {var: val for var, val in block.live_out.items() if var not in block.def_set and var not in block.phi_defs}
         # Add use_set keys
         for var in block.use_set:
-            block.live_in[var] = float("inf")
-
-        # Add PhiDefs(B) to LiveIn(B)
-        for var in block.phi_defs:
             block.live_in[var] = float("inf")
 
         # Initialize per-value use position collection (will be converted to next_use_distances_by_val after propagation)
@@ -621,13 +618,17 @@ def propagate_loop_liveness(
 
             # Propagate all loop live vars to the header and children
             for var, val in loop_live_vars.items():
-                block_n.live_in[var] = min(block_n.live_in.get(var, val), val)
+                # Don't add variables to live_in if they're defined in this block
+                if var not in block_n.def_set and var not in block_n.phi_defs:
+                    block_n.live_in[var] = min(block_n.live_in.get(var, val), val)
                 block_n.live_out[var] = min(block_n.live_out.get(var, val), val)
 
             for child in node.children:
                 block_m = function.blocks[child.block_name]
                 for var, val in loop_live_vars.items():
-                    block_m.live_in[var] = min(block_m.live_in.get(var, val), val)
+                    # Don't add variables to live_in if they're defined in this block
+                    if var not in block_m.def_set and var not in block_m.phi_defs:
+                        block_m.live_in[var] = min(block_m.live_in.get(var, val), val)
                     block_m.live_out[var] = min(block_m.live_out.get(var, val), val)
 
                 # Recursively process child
@@ -738,6 +739,9 @@ def propagate_next_use_distances(
                             temp_in[use] = min(temp_in[use], i)
 
         for var in list(temp_in.keys()):
+            # Don't add variables to live_in if they're defined in this block
+            if var in defined_vars:
+                continue
             dist = temp_in[var]
             if dist >= block_len and var in block.live_out:
                 dist = min(dist, block.live_out[var] + block_len)
@@ -1017,8 +1021,9 @@ def compute_liveness(function: Function) -> None:
     for block_name in postorder:
         block = function.blocks[block_name]
         # Compute live_out as the merged live_in from all successors, taking minimums
-        # Start with empty live_out (original code started with {})
-        live_out = {}
+        # Start with phi_uses (values flowing into phis from this block)
+        # Phi uses happen at successor entry, so distance is 0 from block exit
+        live_out = {var: 0 for var in block.phi_uses}
         
         for succ in block.successors:
             if succ in function.blocks:
@@ -1053,14 +1058,10 @@ def compute_liveness(function: Function) -> None:
         
         # Recompute live_in distances after live_out changed
         # LiveIn(B) = (LiveOut(B) - DEF(B)) ∪ USE(B)
-        # Start with live_out, excluding def_set keys
-        block.live_in = {var: val for var, val in block.live_out.items() if var not in block.def_set}
+        # Start with live_out, excluding def_set and phi_defs keys
+        block.live_in = {var: val for var, val in block.live_out.items() if var not in block.def_set and var not in block.phi_defs}
         # Add use_set keys
         for var in block.use_set:
-            block.live_in[var] = float("inf")
-
-        # Add PhiDefs(B) to LiveIn(B)
-        for var in block.phi_defs:
             block.live_in[var] = float("inf")
         
         # Process instructions in reverse to recompute distances

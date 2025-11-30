@@ -21,6 +21,14 @@
             "args": "examples/linear_gap.ir"
         },
         {
+            "name": "debug loop_exit",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "integratedTerminal",
+            "args": "examples/loop_exit.ir"
+        },
+        {
             "name": "Python Debugger: reg_pressure/merge_use.ir",
             "type": "debugpy",
             "request": "launch",
