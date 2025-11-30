@@ -37,12 +37,6 @@ def compute_predecessors_and_use_def_sets(function: Function) -> None:
     Args:
         function: The Function object with blocks
     """
-    # Initialize sets for all blocks
-    for block in function.blocks.values():
-        block.use_set = set()
-        block.def_set = set()
-        block.phi_uses = set()
-        block.phi_defs = set()
 
     # Single pass over all blocks
     for block_name, block in function.blocks.items():
@@ -201,6 +195,7 @@ def expand_loop_blocks(
             if pred not in members and pred in function.blocks:
                 members.add(pred)
                 stack.append(pred)
+    assert(members ==set([src for src, tgt in loop_edges]+[tgt for src, tgt in loop_edges]))
     return members
 
 
