@@ -9,13 +9,13 @@ next-use distance information to decide which variables to spill when register
 pressure exceeds the available number of registers k.
 """
 
+from collections import defaultdict
 import math
 import bisect
 from typing import Dict, List, Set, Union, Tuple
 from dataclasses import dataclass
 from ir import Function, Block, Op, Jump, Phi
 from liveness import get_next_use_distance
-from collections import defaultdict
 def topological_order(function: Function) -> List[str]:
     """
     Return blocks in topological order (predecessors before successors).
@@ -154,19 +154,19 @@ def limit(W: Set[int], S: Set[int], insn_idx: int, block: Block, m: int, spills:
 
 
 
-def initUsual(block: Block, pred_W_exits: Dict[str, Set[int]], k: int, function: Function) -> Set[int]:
+def initUsual(block: Block, pred_W_exits: Dict[str, Set[int]], k: int, function: Function, vars_available_from_all: Set[int]) -> Set[int]:
     """
     Initialize W_entry for a block using the "usual" initialization strategy.
 
-    Counts frequency of variables across predecessors' W_exit sets, then selects
-    variables that appear in all predecessors first, followed by others sorted
-    by next-use distance at block entry.
+    Uses vars_available_from_all to select variables that appear in all predecessors first,
+    followed by others sorted by next-use distance at block entry.
 
     Args:
         block: The block to initialize
         pred_W_exits: Map from predecessor block names to their W_exit sets (value indices)
         k: Number of available registers
         function: The function containing the block
+        vars_available_from_all: Variables available from all processed predecessors
 
     Returns:
         Set of value indices that should be in registers at block entry
@@ -215,16 +215,6 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[int]], k: int, function:
                 freq[val_idx] = available_from
                 cand.add(val_idx)
 
-    # Variables that appear in all predecessors go to take
-    num_preds = len(block.predecessors)
-    to_remove = []
-    for val_idx in cand:
-        if freq[val_idx] == num_preds:
-            take.add(val_idx)
-            to_remove.append(val_idx)
-
-    for val_idx in to_remove:
-        cand.remove(val_idx)
 
     # If we have more variables in take than available registers,
     # select the k best ones from take based on next-use distance
@@ -548,20 +538,22 @@ def insert_coupling_code_for_edge(pred_name: str, block_name: str, W_entry: Set[
     
     # Check if reloading would exceed k registers
     # After reloads, we'll have: pred_W_exit ∪ reload_vars
-    W_after_reload = (pred_W_exit | reload_vars) - pred_S_exit
+    W_after_reload = pred_W_exit | reload_vars
     if len(W_after_reload) > k:
         # Need to spill some variables from pred_W_exit to make room for reloads
         # Compute how many we need to spill
         num_to_spill = len(W_after_reload) - k
         
-        # Sort variables in pred_W_exit by next-use distance in the current block
-        # Use the first instruction index (0) as reference point
-        sorted_pred_vars = sorted(pred_W_exit, key=lambda v: (get_next_use_distance(block, v, 0, function), v))
+        # Sort ALL variables in pred_W_exit by next-use distance (furthest first)
+        # Spill based on next-use distance only, not preferring silently evictable variables
+        sorted_pred_vars = sorted(pred_W_exit, key=lambda v: (get_next_use_distance(block, v, 0, function), v), reverse=True)
         
-        # Spill the variables with furthest next use (last in sorted list)
-        vars_to_spill_for_reloads = set(sorted_pred_vars[-num_to_spill:])
+        # Evict variables with furthest next use
+        vars_to_spill_for_reloads = set(sorted_pred_vars[:num_to_spill])
         
         # Insert spills before reloads
+        # Note: For variables already in pred_S_exit, spilling is a no-op for S but removes from R
+        # We still insert spill instructions for state tracking
         for val_idx in vars_to_spill_for_reloads:
             if get_next_use_distance(block, val_idx, 0, function) != math.inf:
                 insert_spill_reload_sorted(result[pred_name], SpillReload("spill", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
@@ -608,13 +600,23 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
     # Process each block in topological order
     for block_name in block_order:
         block = function.blocks[block_name]
-
+        
+        # First, compute which variables are available from ALL processed predecessors
+        processed_preds = list()
+        for pred_name in block.predecessors:
+            if pred_name not in W_exit_map:
+                blocks_needing_second_pass.add(pred_name)
+            else:
+                processed_preds.append(pred_name)
+        
+        vars_available_from_all = set.intersection(*[W_exit_map[p] for p in processed_preds]) if processed_preds else set()
         # Initialize W_entry and S_entry for this block
         if not block.predecessors:
             # Entry block: start with empty sets
             W_entry = set()
             S_entry = set()
         else:
+   
             # Check if this block is a loop header
             if block_name in loop_membership:
                 # Use initLoopHeader for loop headers
@@ -623,7 +625,7 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
             else:
                 # Use initUsual for non-loop headers
                 pred_W_exits = {pred: W_exit_map.get(pred, set()) for pred in block.predecessors}
-                W_entry = initUsual(block, pred_W_exits, k, function)
+                W_entry = initUsual(block, pred_W_exits, k, function, vars_available_from_all)
                 S_entry = set()
 
             # Compute S_entry: variables spilled on some path to this block or not in W_entry but live_out
@@ -634,15 +636,7 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
             S_entry = S_exits & W_entry | S_entry
 
         # Insert coupling code for each predecessor that has already been processed
-        # First, compute which variables are available from ALL processed predecessors
-        processed_preds = list()
-        for pred_name in block.predecessors:
-            if pred_name not in W_exit_map:
-                blocks_needing_second_pass.add(pred_name)
-            else:
-                processed_preds.append(pred_name)
-        
-        vars_available_from_all = set.intersection(*[W_exit_map[p] for p in processed_preds]) if processed_preds else set()
+
 
         
         for pred_name in processed_preds:

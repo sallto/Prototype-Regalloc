@@ -93,6 +93,14 @@ class EvictionEvent:
     block_name: str       # Block name for error reporting
 
 
+@dataclass
+class LineState:
+    """State at a specific line in the IR."""
+    R: Set[str]  # Variables in registers
+    S: Set[str]  # Variables in spill slots
+    eviction_candidates: Set[str]  # Active eviction candidates
+
+
 def parse_checks(ir_content: str) -> Dict[CheckType, List[CheckDirective]]:
     """
     Parse CHECK directives from IR file content.
@@ -859,7 +867,7 @@ def remove_dead_variables_from_r(state: RegisterState, block_name: str, instr_id
             state.R.discard(var)
 
 
-def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> Tuple[bool, List[RegPressureError], List[str]]:
+def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> Tuple[bool, List[RegPressureError], List[str], Dict[int, LineState]]:
     """
     Verify register pressure by simulating R and S sets through the program.
     Stops at the first error found.
@@ -870,9 +878,12 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
         file_name: Name of the file being checked (for error messages)
         
     Returns:
-        Tuple of (success, list of errors, annotated IR lines)
+        Tuple of (success, list of errors, annotated IR lines, line_states dictionary)
     """
     errors: List[RegPressureError] = []
+    
+    # Track state at each line
+    line_states: Dict[int, LineState] = {}
     
     # Parse the original IR file to get liveness information
     original_function = None
@@ -908,7 +919,7 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
             block_name="",
             line_number=0
         ))
-        return False, errors, spill_lines
+        return False, errors, spill_lines, line_states
     
     if not function.blocks:
         errors.append(RegPressureError(
@@ -917,7 +928,7 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
             block_name="",
             line_number=0
         ))
-        return False, errors, spill_lines
+        return False, errors, spill_lines, line_states
     
     # Track final state of each block
     block_final_states: Dict[str, RegisterState] = {}
@@ -961,15 +972,30 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
         remove_dead_variables_from_r(state, block_name, 0, original_function, function)
         
         # Filter active events at block entry: update candidates based on current state
-        # At merge points, candidates that are not in R ∩ S were evicted in at least one path
-        # We keep tracking them until we see them used or reloaded to determine which was evicted
+        # At merge points, candidates that are not in R were evicted - constraint satisfied
+        # We resolve events when any candidate drops out of R (confirmed evicted)
         for event in active_events[:]:
-            # Update candidates: only keep those still possible (in R ∩ S at entry)
-            # If a candidate is not in R ∩ S, it was evicted or used/spilled in all paths
-            event.candidates &= (state.R & state.S)
-            # If all candidates were removed, the event is resolved (all were evicted)
-            if not event.candidates:
+            # Check which candidates dropped out of R (they were evicted)
+            evicted = event.candidates - state.R
+            if evicted:
+                # At least one candidate was evicted -> constraint satisfied, resolve event
                 active_events.remove(event)
+            else:
+                # All candidates still in R - update to those still in R ∩ S
+                event.candidates &= (state.R & state.S)
+                if not event.candidates:
+                    active_events.remove(event)
+        
+        # Capture state at block entry (after dead variable removal and event filtering)
+        # Find the first instruction line number for this block
+        if block.instructions:
+            first_line = block.instructions[0].line_number
+            eviction_candidates = set().union(*[e.candidates for e in active_events]) if active_events else set()
+            line_states[first_line] = LineState(
+                R=state.R.copy(),
+                S=state.S.copy(),
+                eviction_candidates=eviction_candidates
+            )
         
         # Process each instruction in the block
         found_error = False
@@ -1001,24 +1027,30 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                         line_number=instr.line_number,
                         variable=var
                     ))
+                    # Capture state before breaking
+                    eviction_candidates = set().union(*[e.candidates for e in active_events]) if active_events else set()
+                    line_states[instr.line_number] = LineState(
+                        R=state.R.copy(),
+                        S=state.S.copy(),
+                        eviction_candidates=eviction_candidates
+                    )
                     found_error = True
                     break
                 
-                # Error: Double-spill (variable already in S)
-                if var in state.S:
-                    errors.append(RegPressureError(
-                        error_type="DOUBLE_SPILL",
-                        message=f"spill {var} but {var} is already spilled (R={sorted(state.R)}, S={sorted(state.S)})",
-                        block_name=block_name,
-                        line_number=instr.line_number,
-                        variable=var
-                    ))
-                    found_error = True
-                    break
-                
-                # Perform spill: remove from R, add to S
+                # Perform spill: remove from R, add to S (if not already in S)
+                # Note: Spilling a variable that's already in S is allowed - it's a no-op for S
+                # but removes the variable from R (silent eviction)
                 state.R.discard(var)
-                state.S.add(var)
+                if var not in state.S:
+                    state.S.add(var)
+                
+                # Capture state after spill instruction
+                eviction_candidates = set().union(*[e.candidates for e in active_events]) if active_events else set()
+                line_states[instr.line_number] = LineState(
+                    R=state.R.copy(),
+                    S=state.S.copy(),
+                    eviction_candidates=eviction_candidates
+                )
                 
             elif instr.kind == "reload":
                 var = instr.variable
@@ -1034,6 +1066,13 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                         line_number=instr.line_number,
                         variable=var
                     ))
+                    # Capture state before breaking
+                    eviction_candidates = set().union(*[e.candidates for e in active_events]) if active_events else set()
+                    line_states[instr.line_number] = LineState(
+                        R=state.R.copy(),
+                        S=state.S.copy(),
+                        eviction_candidates=eviction_candidates
+                    )
                     found_error = True
                     break
                 
@@ -1060,6 +1099,13 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                         line_number=instr.line_number,
                         variable=var
                     ))
+                    # Capture state before breaking
+                    eviction_candidates = set().union(*[e.candidates for e in active_events]) if active_events else set()
+                    line_states[instr.line_number] = LineState(
+                        R=state.R.copy(),
+                        S=state.S.copy(),
+                        eviction_candidates=eviction_candidates
+                    )
                     found_error = True
                     break
                 
@@ -1082,6 +1128,13 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                             line_number=instr.line_number,
                             variable=var
                         ))
+                        # Capture state before breaking
+                        eviction_candidates_set = set().union(*[e.candidates for e in active_events]) if active_events else set()
+                        line_states[instr.line_number] = LineState(
+                            R=state.R.copy(),
+                            S=state.S.copy(),
+                            eviction_candidates=eviction_candidates_set
+                        )
                         found_error = True
                         break
                     else:
@@ -1099,6 +1152,14 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                 else:
                     # No register pressure - just add to R
                     state.R.add(var)
+                
+                # Capture state after reload instruction
+                eviction_candidates = set().union(*[e.candidates for e in active_events]) if active_events else set()
+                line_states[instr.line_number] = LineState(
+                    R=state.R.copy(),
+                    S=state.S.copy(),
+                    eviction_candidates=eviction_candidates
+                )
                 
             elif instr.kind == "op":
                 # Before processing uses, remove any dead variables from R
@@ -1121,6 +1182,13 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                                     line_number=instr.line_number,
                                     variable=use_var
                                 ))
+                                # Capture state before breaking
+                                eviction_candidates = set().union(*[e.candidates for e in active_events]) if active_events else set()
+                                line_states[instr.line_number] = LineState(
+                                    R=state.R.copy(),
+                                    S=state.S.copy(),
+                                    eviction_candidates=eviction_candidates
+                                )
                                 found_error = True
                                 break
                     
@@ -1136,6 +1204,13 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                             line_number=instr.line_number,
                             variable=use_var
                         ))
+                        # Capture state before breaking
+                        eviction_candidates = set().union(*[e.candidates for e in active_events]) if active_events else set()
+                        line_states[instr.line_number] = LineState(
+                            R=state.R.copy(),
+                            S=state.S.copy(),
+                            eviction_candidates=eviction_candidates
+                        )
                         found_error = True
                         break
                 
@@ -1172,12 +1247,27 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                             line_number=instr.line_number,
                             variable=def_var
                         ))
+                        # Capture state before breaking
+                        eviction_candidates = set().union(*[e.candidates for e in active_events]) if active_events else set()
+                        line_states[instr.line_number] = LineState(
+                            R=state.R.copy(),
+                            S=state.S.copy(),
+                            eviction_candidates=eviction_candidates
+                        )
                         found_error = True
                         break
                     
                     # Add to registers
                     state.R.add(def_var)
                     # Note: S only shrinks at block entry merges, not when variables are defined
+                
+                # Capture state after op instruction
+                eviction_candidates = set().union(*[e.candidates for e in active_events]) if active_events else set()
+                line_states[instr.line_number] = LineState(
+                    R=state.R.copy(),
+                    S=state.S.copy(),
+                    eviction_candidates=eviction_candidates
+                )
                 
             elif instr.kind == "phi":
                 # Phi defines a variable - similar to op defs
@@ -1203,11 +1293,26 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
                             line_number=instr.line_number,
                             variable=def_var
                         ))
+                        # Capture state before breaking
+                        eviction_candidates = set().union(*[e.candidates for e in active_events]) if active_events else set()
+                        line_states[instr.line_number] = LineState(
+                            R=state.R.copy(),
+                            S=state.S.copy(),
+                            eviction_candidates=eviction_candidates
+                        )
                         found_error = True
                         break
                     
                     state.R.add(def_var)
                     # Note: S only shrinks at block entry merges, not when variables are defined
+                
+                # Capture state after phi instruction
+                eviction_candidates = set().union(*[e.candidates for e in active_events]) if active_events else set()
+                line_states[instr.line_number] = LineState(
+                    R=state.R.copy(),
+                    S=state.S.copy(),
+                    eviction_candidates=eviction_candidates
+                )
         
         # If we found an error, stop processing blocks
         if found_error:
@@ -1219,16 +1324,17 @@ def verify_register_pressure(spill_lines: List[str], k: int, file_name: str) -> 
             S=state.S.copy()
         )
     
-    return len(errors) == 0, errors, spill_lines
+    return len(errors) == 0, errors, spill_lines, line_states
 
 
-def print_ir_with_errors(spill_lines: List[str], errors: List[RegPressureError]) -> None:
+def print_ir_with_errors(spill_lines: List[str], errors: List[RegPressureError], line_states: Dict[int, LineState]) -> None:
     """
     Print the IR with errors annotated inline where they occurred.
     
     Args:
         spill_lines: List of lines from the SPILL section
         errors: List of errors found (should have at least one)
+        line_states: Dictionary mapping line numbers to their state
     """
     if not errors:
         return
@@ -1239,16 +1345,28 @@ def print_ir_with_errors(spill_lines: List[str], errors: List[RegPressureError])
         if error.line_number > 0:
             error_by_line[error.line_number] = error
     
-    # Print the IR with error annotations
+    # Print the IR with error annotations and state
     for line_num, line in enumerate(spill_lines, start=1):
+        stripped = line.rstrip()
+        state_str = ""
+        
+        # Add state annotation if available
+        if line_num in line_states:
+            ls = line_states[line_num]
+            state_str = f"  # R={sorted(ls.R)} S={sorted(ls.S)}"
+            if ls.eviction_candidates:
+                state_str += f" evict={sorted(ls.eviction_candidates)}"
+        
+        # Add error annotation if present
         if line_num in error_by_line:
             error = error_by_line[line_num]
-            # Print the line with error annotation
-            stripped = line.rstrip()
-            # Add error annotation as a comment
-            print(f"{stripped}  # ERROR: {error.error_type}: {error.message}", file=sys.stderr)
+            error_str = f"  # ERROR: {error.error_type}: {error.message}"
+            print(f"{stripped}{state_str}{error_str}", file=sys.stderr)
         else:
-            print(line, file=sys.stderr)
+            if state_str:
+                print(f"{stripped}{state_str}", file=sys.stderr)
+            else:
+                print(line, file=sys.stderr)
 
 
 def run_main_program(ir_file: str, k: int) -> str:
@@ -1304,7 +1422,7 @@ def main():
             print(f"{args.file}: Error: No SPILL section found in output", file=sys.stderr)
             sys.exit(1)
         
-        success, errors, annotated_lines = verify_register_pressure(spill_lines, args.registers, args.file)
+        success, errors, annotated_lines, line_states = verify_register_pressure(spill_lines, args.registers, args.file)
         
         if success:
             print(f"{args.file}: Register pressure verification passed!")
@@ -1314,7 +1432,7 @@ def main():
             print("", file=sys.stderr)
             print("IR with errors:", file=sys.stderr)
             print("=" * 70, file=sys.stderr)
-            print_ir_with_errors(annotated_lines, errors)
+            print_ir_with_errors(annotated_lines, errors, line_states)
             sys.exit(1)
     
     if args.update:
