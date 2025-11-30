@@ -45,5 +45,5 @@ block b2:
 ; CHECK-COLOR-K3: spill %v2
 ; CHECK-COLOR-K3: phi %v6->r0 [b0, %v1, b1, %v4]
 ; CHECK-COLOR-K3: reload %v2 -> r2
-; CHECK-COLOR-K3: op uses=%v2,%v6 defs=%v7->r0
+; CHECK-COLOR-K3: op uses=%v2,%v6 defs=%v7->r1
 ; CHECK-COLOR-K3: op uses=%v7

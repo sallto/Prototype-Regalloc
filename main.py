@@ -582,11 +582,7 @@ def compute_register_state(function: Function, spills_reloads: Dict[str, List[Sp
             # This is a simplification - coupling code will handle actual transitions
             register_state = [None] * k
             from ir import get_val_name
-            live_in_val_indices = set()
-            if isinstance(block.live_in, dict):
-                live_in_val_indices = set(block.live_in.keys())
-            elif isinstance(block.live_in, set):
-                live_in_val_indices = block.live_in
+            live_in_val_indices = set(block.live_in.keys())
             
             # Check for variables that should be in registers at block entry
             # (those that are live-in, have colors, and weren't spilled)
@@ -796,11 +792,7 @@ def print_function_with_register_state(function: Function, spills_reloads: Dict[
         
         # Initialize from live-in variables that have colors (simplified)
         from ir import get_val_name
-        live_in_val_indices = set()
-        if isinstance(block.live_in, dict):
-            live_in_val_indices = set(block.live_in.keys())
-        elif isinstance(block.live_in, set):
-            live_in_val_indices = block.live_in
+        live_in_val_indices = set(block.live_in.keys())
         
         for val_idx in live_in_val_indices:
             try:

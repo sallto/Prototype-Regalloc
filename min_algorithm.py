@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from ir import Function, Block, Op, Jump, Phi
 from liveness import get_next_use_distance
 from collections import defaultdict
-
 def topological_order(function: Function) -> List[str]:
     """
     Return blocks in topological order (predecessors before successors).
@@ -671,27 +670,16 @@ def is_last_use(val_idx: int, block: Block, instr_idx: int, function: Function) 
         True if this is the last use of the variable
     """
     # Check if variable is live-out
-    if isinstance(block.live_out, dict):
-        if val_idx in block.live_out:
+    if val_idx in block.live_out:
             # Variable is live-out, so it's not the last use
-            return False
-    elif isinstance(block.live_out, set):
-        if val_idx in block.live_out:
             return False
     
     # Variable is not live-out, check if there are more uses in this block
     # Scan forward from the next instruction
-    for i in range(instr_idx + 1, len(block.instructions)):
-        instr = block.instructions[i]
-        if isinstance(instr, Op):
-            for use_var in instr.uses:
-                if use_var in function.value_indices and function.value_indices[use_var] == val_idx:
-                    return False
-        elif isinstance(instr, Phi):
-            # Check if val_idx is used as an incoming value
-            for incoming in instr.incomings:
-                if incoming.value in function.value_indices and function.value_indices[incoming.value] == val_idx:
-                    return False
+    # Use next_use_distance utility to check for further uses in the block.
+    # next_use_distance returns None if there is no further use, otherwise returns the distance.
+    if get_next_use_distance(block, val_idx, instr_idx, function) is not None:
+        return False
     
     # No more uses found, this is the last use
     return True
@@ -722,11 +710,7 @@ def color_recursive(block_name: str, k: int, color_assignment: Dict[int, int],
     
     # Reset assigned to only include colors of live-in variables
     # All variables live-in have already been colored (by dominating blocks)
-    live_in_val_indices = set()
-    if isinstance(block.live_in, dict):
-        live_in_val_indices = set(block.live_in.keys())
-    elif isinstance(block.live_in, set):
-        live_in_val_indices = block.live_in
+    live_in_val_indices = set(block.live_in.keys())
     
     # Reset assigned set to only include colors of live-in variables
     # But exclude variables that were spilled (they're not in registers)
@@ -865,14 +849,8 @@ def color_recursive(block_name: str, k: int, color_assignment: Dict[int, int],
                 if not available:
                     for val_idx, color_val in sorted(color_assignment.items(), key=lambda x: x[1]):
                         if color_val in assigned:
-                            # Check if this variable is dead
-                            is_dead = False
-                            if isinstance(block.live_out, dict):
-                                is_dead = val_idx not in block.live_out
-                            elif isinstance(block.live_out, set):
-                                is_dead = val_idx not in block.live_out
-                            else:
-                                is_dead = True
+                            is_dead = val_idx not in block.live_out
+                            
                             
                             # Also check if there are more uses after current instruction
                             if is_dead:
