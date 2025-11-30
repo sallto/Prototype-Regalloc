@@ -627,23 +627,25 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
                 S_entry = set()
 
             # Compute S_entry: variables spilled on some path to this block or not in W_entry but live_out
-
+            S_exits = set()
             for pred in block.predecessors:
                 if pred in S_exit_map:
-                    S_entry.update(S_exit_map[pred] & W_entry)
-            
+                    S_exits.update(S_exit_map[pred])
+            S_entry = S_exits & W_entry | S_entry
 
         # Insert coupling code for each predecessor that has already been processed
         # First, compute which variables are available from ALL processed predecessors
-        processed_preds = [p for p in block.predecessors if p in W_exit_map]
+        processed_preds = list()
+        for pred_name in block.predecessors:
+            if pred_name not in W_exit_map:
+                blocks_needing_second_pass.add(pred_name)
+            else:
+                processed_preds.append(pred_name)
+        
         vars_available_from_all = set.intersection(*[W_exit_map[p] for p in processed_preds]) if processed_preds else set()
 
         
-        for pred_name in block.predecessors:
-            # Only insert coupling code if the predecessor has been processed
-            if pred_name not in W_exit_map:
-                blocks_needing_second_pass.add(pred_name)
-                continue
+        for pred_name in processed_preds:
 
             pred_W_exit = W_exit_map[pred_name]
             pred_S_exit = S_exit_map.get(pred_name, set())
@@ -661,14 +663,12 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
         for insn_idx, instr in enumerate(block.instructions):
             # Get uses and defs for this instruction (convert to val_idx)
             if isinstance(instr, Op):
-                instr_uses_val_idx = {function.value_indices[var] for var in instr.uses if var in function.value_indices}
-                instr_defs_val_idx = {function.value_indices[var] for var in instr.defs if var in function.value_indices}
+                instr_uses_val_idx = {function.value_indices[var] for var in instr.uses}
+                instr_defs_val_idx = {function.value_indices[var] for var in instr.defs}
             elif isinstance(instr, Phi):
-                # Phi instructions define their destination but don't use variables directly
-                # (uses come from incoming values, handled at block boundaries)
-                instr_uses_val_idx = set()
-
-                instr_defs_val_idx = {function.value_indices[instr.dest]}
+                # we can't insert spills or reloads for phi instructions
+                W.add(function.value_indices[instr.dest])
+                continue
             else:
                 continue
 

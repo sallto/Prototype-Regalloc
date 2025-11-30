@@ -28,9 +28,7 @@ block b2:
 ; CHECK-SPILL-K3: jmp b1,b2
 ; CHECK-SPILL-K3: op uses=%v1,%v2 defs=%v4
 ; CHECK-SPILL-K3: jmp b2
-; CHECK-SPILL-K3: spill %v2
 ; CHECK-SPILL-K3: phi %v6 [b0, %v1, b1, %v4]
-; CHECK-SPILL-K3: reload %v2
 ; CHECK-SPILL-K3: op uses=%v2,%v6 defs=%v7
 ; CHECK-SPILL-K3: op uses=%v7
 
@@ -42,8 +40,6 @@ block b2:
 ; CHECK-COLOR-K3: jmp b1,b2
 ; CHECK-COLOR-K3: op uses=%v1,%v2 defs=%v4->r0
 ; CHECK-COLOR-K3: jmp b2
-; CHECK-COLOR-K3: spill %v2
 ; CHECK-COLOR-K3: phi %v6->r0 [b0, %v1, b1, %v4]
-; CHECK-COLOR-K3: reload %v2 -> r2
 ; CHECK-COLOR-K3: op uses=%v2,%v6 defs=%v7->r1
 ; CHECK-COLOR-K3: op uses=%v7
