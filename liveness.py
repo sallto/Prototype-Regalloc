@@ -567,13 +567,13 @@ def propagate_loop_liveness_and_distances(
 
 
 
-def get_next_use_distance(block: Block, var: str, current_idx: int, function: Function) -> float:
+def get_next_use_distance(block: Block, val_idx: int, current_idx: int, function: Function) -> float:
     """
     Get the next-use distance for a variable at a given instruction index.
     
     Args:
         block: The block containing the variable
-        var: The variable name
+        val_idx: The value index (integer identifier)
         current_idx: The current instruction index (0-based from block start)
         function: The function containing value_indices mapping
         
@@ -584,14 +584,14 @@ def get_next_use_distance(block: Block, var: str, current_idx: int, function: Fu
     # Check if variable is defined at the current instruction
     if current_idx < len(block.instructions):
         current_instr = block.instructions[current_idx]
-        if isinstance(current_instr, Op) and var in current_instr.defs:
-            return 0.0
-        elif isinstance(current_instr, Phi) and current_instr.dest == var:
-            return 0.0
+        if isinstance(current_instr, Op):
+            for def_var in current_instr.defs:
+                if def_var in function.value_indices and function.value_indices[def_var] == val_idx:
+                    return 0.0
+        elif isinstance(current_instr, Phi):
+            if current_instr.dest in function.value_indices and function.value_indices[current_instr.dest] == val_idx:
+                return 0.0
     
-    if var not in function.value_indices:
-        return math.inf
-    val_idx = function.value_indices[var]
     if not hasattr(block, 'next_use_distances_by_val') or val_idx not in block.next_use_distances_by_val:
         return math.inf
     use_positions = block.next_use_distances_by_val[val_idx]

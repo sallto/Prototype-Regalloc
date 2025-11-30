@@ -61,7 +61,7 @@ def topological_order(function: Function) -> List[str]:
 class SpillReload:
     """Represents a spill or reload operation."""
     type: str  # "spill" or "reload"
-    variable: str
+    val_idx: int  # Value index (integer identifier)
     position: int  # Position where this operation should be inserted (0 = before first instruction)
     block_name: str
     is_coupling: bool = False  # True if this is coupling code between blocks
@@ -70,19 +70,19 @@ class SpillReload:
     def __str__(self) -> str:
         location = f"{self.block_name}:{self.position}"
         if self.is_coupling:
-            return f"{self.type} {self.variable} at {location} (coupling: {self.edge_info})"
+            return f"{self.type} val_idx={self.val_idx} at {location} (coupling: {self.edge_info})"
         else:
-            return f"{self.type} {self.variable} at {location}"
+            return f"{self.type} val_idx={self.val_idx} at {location}"
 
 
 def insert_spill_reload_sorted(operations_list: List[SpillReload], spill_reload: SpillReload) -> None:
     """
     Insert a SpillReload into a list while maintaining sorted order.
     
-    The list is sorted by (position, type_priority, variable) where:
+    The list is sorted by (position, type_priority, val_idx) where:
     - position: insertion position (0 = before first instruction)
     - type_priority: 0 for "spill", 1 for "reload" (spills come before reloads)
-    - variable: variable name for stable sorting
+    - val_idx: value index for stable sorting
     
     Args:
         operations_list: List of SpillReload operations (must already be sorted)
@@ -90,15 +90,15 @@ def insert_spill_reload_sorted(operations_list: List[SpillReload], spill_reload:
     """
     import traceback
 
-    # Compute sort key: (position, type_priority, variable)
+    # Compute sort key: (position, type_priority, val_idx)
     type_priority = 0 if spill_reload.type == "spill" else 1
-    key = (spill_reload.position, type_priority, spill_reload.variable)
+    key = (spill_reload.position, type_priority, spill_reload.val_idx)
 
     # Find insertion point using binary search
     # Create a key function for comparison
     def get_key(op: SpillReload) -> tuple:
         op_type_priority = 0 if op.type == "spill" else 1
-        return (op.position, op_type_priority, op.variable)
+        return (op.position, op_type_priority, op.val_idx)
 
     keys = [get_key(op) for op in operations_list]
     insert_idx = bisect.bisect_left(keys, key)
@@ -113,13 +113,13 @@ def insert_spill_reload_sorted(operations_list: List[SpillReload], spill_reload:
 
 
 
-def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills: List[SpillReload], function: Function) -> Set[str]:
+def limit(W: Set[int], S: Set[int], insn_idx: int, block: Block, m: int, spills: List[SpillReload], function: Function) -> Set[int]:
     """
     Evict variables from W to keep only m variables with closest next-use distances.
 
     Args:
-        W: Set of variables currently in registers
-        S: Set of variables already spilled
+        W: Set of value indices currently in registers
+        S: Set of value indices already spilled
         insn_idx: Index of current instruction in block
         block: Block containing the instruction
         m: Maximum number of variables to keep in registers
@@ -127,7 +127,7 @@ def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills:
         function: The function containing value_indices mapping
 
     Returns:
-        New set W with at most m variables
+        New set W with at most m value indices
     """
     if not W or len(W) <= m:
         return W
@@ -141,10 +141,10 @@ def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills:
     evicted_vars = sorted_vars[m:]
 
     # Create spills for evicted variables that haven't been spilled before and have finite next use
-    for var in evicted_vars:
-        next_use_dist = get_next_use_distance(block, var, insn_idx, function)
-        if var not in S and next_use_dist != math.inf:
-            insert_spill_reload_sorted(spills, SpillReload("spill", var, insn_idx, block.name))
+    for val_idx in evicted_vars:
+        next_use_dist = get_next_use_distance(block, val_idx, insn_idx, function)
+        if val_idx not in S and next_use_dist != math.inf:
+            insert_spill_reload_sorted(spills, SpillReload("spill", val_idx, insn_idx, block.name))
 
     # Update S: remove evicted variables from the already spilled set
     # (since they're being evicted again, they need to be spilled again)
@@ -155,7 +155,7 @@ def limit(W: Set[str], S: Set[str], insn_idx: int, block: Block, m: int, spills:
 
 
 
-def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function: Function) -> Set[str]:
+def initUsual(block: Block, pred_W_exits: Dict[str, Set[int]], k: int, function: Function) -> Set[int]:
     """
     Initialize W_entry for a block using the "usual" initialization strategy.
 
@@ -165,12 +165,12 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function:
 
     Args:
         block: The block to initialize
-        pred_W_exits: Map from predecessor block names to their W_exit sets (variable names)
+        pred_W_exits: Map from predecessor block names to their W_exit sets (value indices)
         k: Number of available registers
         function: The function containing the block
 
     Returns:
-        Set of variable names that should be in registers at block entry
+        Set of value indices that should be in registers at block entry
     """
     if not block.predecessors:
         return set()
@@ -187,45 +187,44 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function:
 
     for pred_name in block.predecessors:
         if pred_name in pred_W_exits:
-            for var in pred_W_exits[pred_name]:
-                # Convert var name to val_idx for comparison
-                if var in function.value_indices:
-                    val_idx = function.value_indices[var]
-                    if val_idx in live_in_val_indices:
-                        freq[var] += 1
-                        cand.add(var)
+            for val_idx in pred_W_exits[pred_name]:
+                if val_idx in live_in_val_indices:
+                    freq[val_idx] += 1
+                    cand.add(val_idx)
         # Variables not in pred_W_exits are ignored (unprocessed predecessors)
 
     # For phi nodes, ensure incoming values are considered for W_entry
     # Add phi incoming values that are available from their predecessors
-    phi_vars = set()
+    phi_val_indices = set()
     for phi in block.phis():
         for incoming in phi.incomings:
-            if incoming.block in pred_W_exits and incoming.value in pred_W_exits[incoming.block]:
-                phi_vars.add(incoming.value)
+            if incoming.value in function.value_indices:
+                incoming_val_idx = function.value_indices[incoming.value]
+                if incoming.block in pred_W_exits and incoming_val_idx in pred_W_exits[incoming.block]:
+                    phi_val_indices.add(incoming_val_idx)
 
     # Add phi vars to candidates with frequency equal to number of predecessors they come from
     # (but actually, for initUsual, we want phi vars that are available)
-    for var in phi_vars:
-        if var not in cand:
+    for val_idx in phi_val_indices:
+        if val_idx not in cand:
             # Count how many predecessors this phi var is available from
             available_from = sum(1 for pred in block.predecessors
-                               if pred in pred_W_exits and var in pred_W_exits[pred])
+                               if pred in pred_W_exits and val_idx in pred_W_exits[pred])
             #assert(available_from == len(block.predecessors))
             if available_from > 0:
-                freq[var] = available_from
-                cand.add(var)
+                freq[val_idx] = available_from
+                cand.add(val_idx)
 
     # Variables that appear in all predecessors go to take
     num_preds = len(block.predecessors)
     to_remove = []
-    for var in cand:
-        if freq[var] == num_preds:
-            take.add(var)
-            to_remove.append(var)
+    for val_idx in cand:
+        if freq[val_idx] == num_preds:
+            take.add(val_idx)
+            to_remove.append(val_idx)
 
-    for var in to_remove:
-        cand.remove(var)
+    for val_idx in to_remove:
+        cand.remove(val_idx)
 
     # If we have more variables in take than available registers,
     # select the k best ones from take based on next-use distance
@@ -267,19 +266,19 @@ def loopOf(block_name: str, loop_membership: Dict[str, Set[str]]) -> Union[str, 
     return None
 
 
-def usedInLoop(loop_header: str, alive_vars: Set[str], loop_membership: Dict[str, Set[str]],
-                function: Function) -> Set[str]:
+def usedInLoop(loop_header: str, alive_vars: Set[int], loop_membership: Dict[str, Set[str]],
+                function: Function) -> Set[int]:
     """
     Return variables from alive_vars that are used in any block within the loop.
 
     Args:
         loop_header: Name of the loop header
-        alive_vars: Set of variable names to check
+        alive_vars: Set of value indices to check
         loop_membership: Dictionary mapping loop headers to sets of blocks in each loop
         function: The function containing the blocks
 
     Returns:
-        Set of variable names from alive_vars that are used in the loop
+        Set of value indices from alive_vars that are used in the loop
     """
     if loop_header not in loop_membership:
         return set()
@@ -293,11 +292,9 @@ def usedInLoop(loop_header: str, alive_vars: Set[str], loop_membership: Dict[str
         block = function.blocks[block_name]
 
         # Check if any alive variables are used in this block
-        for var in alive_vars:
-            if var in function.value_indices:
-                val_idx = function.value_indices[var]
-                if val_idx in block.use_set or val_idx in block.phi_uses:
-                    used_vars.add(var)
+        for val_idx in alive_vars:
+            if val_idx in block.use_set or val_idx in block.phi_uses:
+                used_vars.add(val_idx)
 
     return used_vars
 
@@ -328,24 +325,22 @@ def getLoopMaxPressure(loop_header: str, loop_membership: Dict[str, Set[str]],
     return max_pressure
 
 
-def sortByNextUse(vars: Set[str], entry_instr_idx: int, block: Block, function: Function) -> List[str]:
+def sortByNextUse(vars: Set[int], entry_instr_idx: int, block: Block, function: Function) -> List[int]:
     """
     Sort variables by next-use distance from the entry instruction.
 
     Args:
-        vars: Set of variable names to sort
+        vars: Set of value indices to sort
         entry_instr_idx: Index of the entry instruction (usually 0)
         block: Block containing the variables
         function: Function containing value_indices mapping
 
     Returns:
-        List of variable names sorted by next-use distance (closest first)
+        List of value indices sorted by next-use distance (closest first)
     """
-    def get_next_use_dist(var: str) -> float:
-        if var in function.value_indices:
-            val_idx = function.value_indices[var]
-            if hasattr(block, 'live_in') and isinstance(block.live_in, dict) and val_idx in block.live_in:
-                return block.live_in[val_idx]
+    def get_next_use_dist(val_idx: int) -> float:
+        if hasattr(block, 'live_in') and isinstance(block.live_in, dict) and val_idx in block.live_in:
+            return block.live_in[val_idx]
         return float('inf')
 
     return sorted(vars, key=get_next_use_dist)
@@ -375,7 +370,7 @@ def is_variable_defined_at_position(block: Block, var: str, position: int) -> bo
 
 
 def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
-                   function: Function, k: int) -> Tuple[Set[str], Set[str]]:
+                   function: Function, k: int) -> Tuple[Set[int], Set[int]]:
     """
     Initialize W_entry for a loop header block according to the Min algorithm.
 
@@ -387,10 +382,9 @@ def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
 
     Returns:
         Tuple containing:
-        - Set of variable names that should be in registers at block entry
-        - Set of variable names that should be spilled before entering the loop
+        - Set of value indices that should be in registers at block entry
+        - Set of value indices that should be spilled before entering the loop
     """
-    from ir import get_val_name
     entry = 0  # Index of the first instruction
     loop = loopOf(block.name, loop_membership)
 
@@ -398,18 +392,10 @@ def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
     if loop is None:
         return set(), set()
 
-    # alive = block.phis ∪ block.liveIn (convert val_idx to names)
-    alive_val_indices = block.phi_defs.copy()
+    # alive = block.phis ∪ block.liveIn (already val_idx)
+    alive = block.phi_defs.copy()
     if hasattr(block, 'live_in') and isinstance(block.live_in, dict):
-        alive_val_indices.update(block.live_in.keys())
-    
-    # Convert val_idx to variable names
-    alive = set()
-    for val_idx in alive_val_indices:
-        try:
-            alive.add(get_val_name(function, val_idx))
-        except ValueError:
-            pass  # Skip if val_idx not found
+        alive.update(block.live_in.keys())
 
     # cand = usedInLoop(loop, alive)
     cand = usedInLoop(loop, alive, loop_membership, function)
@@ -469,8 +455,8 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
     block_order = topological_order(function)
 
     # Track W_exit and S_exit for each block
-    W_exit_map = {}  # block_name -> set of variables in registers at exit
-    S_exit_map = {}  # block_name -> set of variables spilled at exit
+    W_exit_map = {}  # block_name -> set of value indices in registers at exit
+    S_exit_map = {}  # block_name -> set of value indices spilled at exit
 
     # Process each block in topological order
     for block_name in block_order:
@@ -519,26 +505,26 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
             pred_block = function.blocks[pred_name]
 
             # Collect phi incoming values that come from this specific predecessor and are already available
-            phi_incoming_vars_from_pred = set()
+            phi_incoming_val_indices_from_pred = set()
             # Also collect ALL phi incoming values that come from OTHER predecessors (don't need them from this edge)
-            phi_incoming_vars_from_other_preds = set()
+            phi_incoming_val_indices_from_other_preds = set()
             for phi in block.phis():
                 for incoming in phi.incomings:
-                    # If this incoming value comes from this predecessor and is already in that predecessor's W_exit
-                    if incoming.block == pred_name and incoming.value in pred_W_exit:
-                        phi_incoming_vars_from_pred.add(incoming.value)
-                    # If this incoming value comes from a different predecessor, we don't need it from this edge
-                    elif incoming.block != pred_name:
-                        phi_incoming_vars_from_other_preds.add(incoming.value)
+                    if incoming.value in function.value_indices:
+                        incoming_val_idx = function.value_indices[incoming.value]
+                        # If this incoming value comes from this predecessor and is already in that predecessor's W_exit
+                        if incoming.block == pred_name and incoming_val_idx in pred_W_exit:
+                            phi_incoming_val_indices_from_pred.add(incoming_val_idx)
+                        # If this incoming value comes from a different predecessor, we don't need it from this edge
+                        elif incoming.block != pred_name:
+                            phi_incoming_val_indices_from_other_preds.add(incoming_val_idx)
 
             # Reload: All variables in W_entry \ W_exit_pred (excluding phi destinations)
             # But skip variables that are available from all predecessors (they don't need reloads)
             # Also skip phi incoming values that are already available from this specific predecessor
             # And skip phi incoming values that come from other predecessors (not needed from this edge)
-            # Convert block.phi_defs and block.def_set (val_idx) to variable names for comparison
-            block_phi_def_names = {var for var in function.value_indices if function.value_indices[var] in block.phi_defs}
-            block_def_names = {var for var in function.value_indices if function.value_indices[var] in block.def_set}
-            reload_vars = ((W_entry - pred_W_exit) - block_phi_def_names) - vars_available_from_all - phi_incoming_vars_from_pred - phi_incoming_vars_from_other_preds - block_def_names
+            # block.phi_defs and block.def_set are already val_idx
+            reload_vars = ((W_entry - pred_W_exit) - block.phi_defs) - vars_available_from_all - phi_incoming_val_indices_from_pred - phi_incoming_val_indices_from_other_preds - block.def_set
             
             # Check if reloading would exceed k registers
             # After reloads, we'll have: pred_W_exit ∪ reload_vars
@@ -556,40 +542,43 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
                 vars_to_spill_for_reloads = set(sorted_pred_vars[-num_to_spill:])
                 
                 # Insert spills before reloads
-                for var in vars_to_spill_for_reloads:
-                    if get_next_use_distance(block, var, 0, function) != math.inf:
-                        insert_spill_reload_sorted(result[pred_name], SpillReload("spill", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+                for val_idx in vars_to_spill_for_reloads:
+                    if get_next_use_distance(block, val_idx, 0, function) != math.inf:
+                        insert_spill_reload_sorted(result[pred_name], SpillReload("spill", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
             
-            for var in reload_vars:
-                insert_spill_reload_sorted(result[pred_name], SpillReload("reload", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+            for val_idx in reload_vars:
+                insert_spill_reload_sorted(result[pred_name], SpillReload("reload", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
             # Spill: All variables in (S_entry \ S_exit_pred) ∩ W_exit_pred
             spill_vars = ((S_entry - pred_S_exit) & pred_W_exit) #| ((pred_W_exit - pred_S_exit - W_entry) & block.live_in.keys())
-            for var in spill_vars:
-                if get_next_use_distance(block, var, 0, function) != math.inf:
-                    insert_spill_reload_sorted(result[pred_name], SpillReload("spill", var, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+            for val_idx in spill_vars:
+                if get_next_use_distance(block, val_idx, 0, function) != math.inf:
+                    insert_spill_reload_sorted(result[pred_name], SpillReload("spill", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
         # Process block instructions starting with W = W_entry, S = S_entry
         W = W_entry.copy()
         S = S_entry.copy()
 
         for insn_idx, instr in enumerate(block.instructions):
-            # Get uses and defs for this instruction
+            # Get uses and defs for this instruction (convert to val_idx)
             if isinstance(instr, Op):
-                instr_uses = instr.uses
-                instr_defs = instr.defs
+                instr_uses_val_idx = {function.value_indices[var] for var in instr.uses if var in function.value_indices}
+                instr_defs_val_idx = {function.value_indices[var] for var in instr.defs if var in function.value_indices}
             elif isinstance(instr, Phi):
                 # Phi instructions define their destination but don't use variables directly
                 # (uses come from incoming values, handled at block boundaries)
-                instr_uses = []
-                instr_defs = [instr.dest]
+                instr_uses_val_idx = set()
+                if instr.dest in function.value_indices:
+                    instr_defs_val_idx = {function.value_indices[instr.dest]}
+                else:
+                    instr_defs_val_idx = set()
             else:
                 # Jump instructions don't use or define variables directly
-                instr_uses = []
-                instr_defs = []
+                instr_uses_val_idx = set()
+                instr_defs_val_idx = set()
 
             # R = uses that are not already in registers (need reload)
-            R = set(instr_uses) - W
+            R = instr_uses_val_idx - W
 
             # Add reloaded variables to both W and S, and track them
             W.update(R)
@@ -599,15 +588,15 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
             W = limit(W, S, insn_idx, block, k, result[block_name], function)
 
             # Second limit: make room for results
-            W = limit(W, S, insn_idx, block, k - len(instr_defs), result[block_name], function)
+            W = limit(W, S, insn_idx, block, k - len(instr_defs_val_idx), result[block_name], function)
 
 
             # Add newly defined variables to W
-            W.update(instr_defs)
+            W.update(instr_defs_val_idx)
 
             # Create reload operations for variables in R (before the instruction)
-            for var in R:
-                insert_spill_reload_sorted(result[block_name], SpillReload("reload", var, insn_idx, block_name))
+            for val_idx in R:
+                insert_spill_reload_sorted(result[block_name], SpillReload("reload", val_idx, insn_idx, block_name))
 
         # Store exit state for this block
         W_exit_map[block_name] = W.copy()
@@ -626,17 +615,17 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
             succ_block = function.blocks[succ_name]
 
             # Check if this successor has phi nodes that need incoming values from this block
-            phi_incoming_vars = set()
+            phi_incoming_val_indices = set()
             for phi in succ_block.phis():
                 for incoming in phi.incomings:
-                    if incoming.block == block_name:
-                        phi_incoming_vars.add(incoming.value)
+                    if incoming.block == block_name and incoming.value in function.value_indices:
+                        phi_incoming_val_indices.add(function.value_indices[incoming.value])
 
             # Reload phi incoming values that aren't in registers at this block's exit
-            phi_reload_vars = phi_incoming_vars - block_W_exit
-            for var in phi_reload_vars:
+            phi_reload_val_indices = phi_incoming_val_indices - block_W_exit
+            for val_idx in phi_reload_val_indices:
                 # Insert reload at the end of this block (before the jump to successor)
-                insert_spill_reload_sorted(result[block_name], SpillReload("reload", var, len(block.instructions) - 1, block_name, is_coupling=True, edge_info=f"{block_name}->{succ_name}"))
+                insert_spill_reload_sorted(result[block_name], SpillReload("reload", val_idx, len(block.instructions) - 1, block_name, is_coupling=True, edge_info=f"{block_name}->{succ_name}"))
 
     return result
 
@@ -664,7 +653,7 @@ def get_spills_at(spills_reloads: Dict[str, List[SpillReload]], block_name: str,
     return result
 
 
-def is_last_use(var: str, block: Block, instr_idx: int, function: Function) -> bool:
+def is_last_use(val_idx: int, block: Block, instr_idx: int, function: Function) -> bool:
     """
     Check if this is the last use of a variable in the block.
     
@@ -673,7 +662,7 @@ def is_last_use(var: str, block: Block, instr_idx: int, function: Function) -> b
     2. It has no more uses after this instruction in the block
     
     Args:
-        var: Variable name to check
+        val_idx: Value index to check
         block: Block containing the instruction
         instr_idx: Index of the current instruction
         function: Function containing the block
@@ -681,35 +670,34 @@ def is_last_use(var: str, block: Block, instr_idx: int, function: Function) -> b
     Returns:
         True if this is the last use of the variable
     """
-    # Check if variable is live-out (convert name to val_idx)
-    if var in function.value_indices:
-        val_idx = function.value_indices[var]
-        if isinstance(block.live_out, dict):
-            if val_idx in block.live_out:
-                # Variable is live-out, so it's not the last use
-                return False
-        elif isinstance(block.live_out, set):
-            if val_idx in block.live_out:
-                return False
+    # Check if variable is live-out
+    if isinstance(block.live_out, dict):
+        if val_idx in block.live_out:
+            # Variable is live-out, so it's not the last use
+            return False
+    elif isinstance(block.live_out, set):
+        if val_idx in block.live_out:
+            return False
     
     # Variable is not live-out, check if there are more uses in this block
     # Scan forward from the next instruction
     for i in range(instr_idx + 1, len(block.instructions)):
         instr = block.instructions[i]
         if isinstance(instr, Op):
-            if var in instr.uses:
-                return False
+            for use_var in instr.uses:
+                if use_var in function.value_indices and function.value_indices[use_var] == val_idx:
+                    return False
         elif isinstance(instr, Phi):
-            # Check if var is used as an incoming value
+            # Check if val_idx is used as an incoming value
             for incoming in instr.incomings:
-                if incoming.value == var:
+                if incoming.value in function.value_indices and function.value_indices[incoming.value] == val_idx:
                     return False
     
     # No more uses found, this is the last use
     return True
 
 
-def color_recursive(block_name: str, k: int, color_assignment: Dict[str, int], 
+def color_recursive(block_name: str, k: int, color_assignment: Dict[int, int], 
                     assigned: Set[int], dom_tree: Dict[str, List[str]], 
                     function: Function, spills_reloads: Dict[str, List[SpillReload]]) -> None:
     """
@@ -724,53 +712,44 @@ def color_recursive(block_name: str, k: int, color_assignment: Dict[str, int],
     Args:
         block_name: Name of the block to process
         k: Number of available colors (registers)
-        color_assignment: Dictionary mapping variables to their assigned colors (ρ)
+        color_assignment: Dictionary mapping value indices to their assigned colors (ρ)
         assigned: Set of currently assigned colors
         dom_tree: Dominator tree mapping blocks to their children
         function: Function containing the blocks
         spills_reloads: Dictionary mapping blocks to spill/reload operations
     """
-    from ir import get_val_name
     block = function.blocks[block_name]
     
     # Reset assigned to only include colors of live-in variables
     # All variables live-in have already been colored (by dominating blocks)
-    # Convert val_idx to variable names
     live_in_val_indices = set()
     if isinstance(block.live_in, dict):
         live_in_val_indices = set(block.live_in.keys())
     elif isinstance(block.live_in, set):
         live_in_val_indices = block.live_in
     
-    live_in_vars = set()
-    for val_idx in live_in_val_indices:
-        try:
-            live_in_vars.add(get_val_name(function, val_idx))
-        except ValueError:
-            pass  # Skip if val_idx not found
-    
     # Reset assigned set to only include colors of live-in variables
     # But exclude variables that were spilled (they're not in registers)
     assigned.clear()
     
     # Check for variables that were spilled - they don't occupy registers
-    spilled_vars = set()
+    spilled_val_indices = set()
     
     # Check spills at position 0 of this block
     spills_at_start = get_spills_at(spills_reloads, block_name, 0)
-    spilled_vars.update(spill.variable for spill in spills_at_start)
+    spilled_val_indices.update(spill.val_idx for spill in spills_at_start)
     
     # Check if variables were spilled before entering this block
     # If a variable was spilled at the end of any block and not reloaded at position 0,
     # it doesn't occupy a register
-    for var in live_in_vars:
+    for val_idx in live_in_val_indices:
         # Check if this variable was spilled at the end of any block
         was_spilled_at_end = False
         for other_block_name, other_spills in spills_reloads.items():
             other_block = function.blocks.get(other_block_name)
             if other_block:
                 for spill in other_spills:
-                    if spill.type == "spill" and spill.variable == var:
+                    if spill.type == "spill" and spill.val_idx == val_idx:
                         # Check if spill is at the end of the block
                         if spill.position >= len(other_block.instructions):
                             was_spilled_at_end = True
@@ -785,84 +764,87 @@ def color_recursive(block_name: str, k: int, color_assignment: Dict[str, int],
         
         # Also check spills at position 0 of this block (before first instruction)
         was_spilled_at_start = any(
-            spill.variable == var for spill in spills_at_start
+            spill.val_idx == val_idx for spill in spills_at_start
         )
         
         # If it was spilled at the end of any block or at position 0, check if it's reloaded at position 0
         if was_spilled_at_end or was_spilled_at_start:
             has_reload_at_start = any(
-                op.type == "reload" and op.variable == var and op.position == 0
+                op.type == "reload" and op.val_idx == val_idx and op.position == 0
                 for op in spills_reloads.get(block_name, [])
             )
             if not has_reload_at_start:
-                spilled_vars.add(var)
+                spilled_val_indices.add(val_idx)
     
     # Check for reloads at position 0 - these also indicate variables that were spilled
     reloads_at_start = [op for op in spills_reloads.get(block_name, []) 
                         if op.type == "reload" and op.position == 0]
-    spilled_vars.update(reload.variable for reload in reloads_at_start)
+    spilled_val_indices.update(reload.val_idx for reload in reloads_at_start)
     
-    for var in live_in_vars:
-        if var in color_assignment:
+    for val_idx in live_in_val_indices:
+        if val_idx in color_assignment:
             # Only mark color as occupied if variable wasn't spilled
             # If it was spilled, it will be reloaded and get its color back then
-            if var not in spilled_vars:
-                assigned.add(color_assignment[var])
+            if val_idx not in spilled_val_indices:
+                assigned.add(color_assignment[val_idx])
     
     # Process each instruction in the block
     for i, instr in enumerate(block.instructions):
         # Handle spills at this position - release their colors
         for spill in get_spills_at(spills_reloads, block_name, i):
-            if spill.variable in color_assignment:
-                assigned.discard(color_assignment[spill.variable])
+            if spill.val_idx in color_assignment:
+                assigned.discard(color_assignment[spill.val_idx])
         
         # Handle reloads at this position - assign colors to reloaded variables
         reloads_at_pos = [op for op in spills_reloads.get(block_name, []) 
                           if op.type == "reload" and op.position == i]
         for reload in reloads_at_pos:
-            if reload.variable not in color_assignment:
+            if reload.val_idx not in color_assignment:
                 # Assign a color to the reloaded variable
                 available = set(range(k)) - assigned
                 if not available:
                     # No available colors - raise exception
                     available_colors = set(range(k))
                     raise RuntimeError(
-                        f"Coloring failed: No available color for reloaded variable {reload.variable} "
+                        f"Coloring failed: No available color for reloaded variable val_idx={reload.val_idx} "
                         f"at position {i} in block {block_name}. "
                         f"Available colors: {available_colors}, Assigned colors: {assigned}, "
                         f"k={k}. All {k} registers are occupied."
                     )
                 color = min(available)
-                color_assignment[reload.variable] = color
+                color_assignment[reload.val_idx] = color
                 assigned.add(color)
             else:
                 # Variable already has a color assignment (from previous block)
                 # Mark it as assigned
-                if reload.variable in color_assignment:
-                    assigned.add(color_assignment[reload.variable])
+                if reload.val_idx in color_assignment:
+                    assigned.add(color_assignment[reload.val_idx])
         
-        # Get uses and defs for this instruction
+        # Get uses and defs for this instruction (convert to val_idx)
         if isinstance(instr, Op):
-            instr_uses = instr.uses
-            instr_defs = instr.defs
+            instr_uses_val_idx = {function.value_indices[var] for var in instr.uses if var in function.value_indices}
+            instr_defs_val_idx = {function.value_indices[var] for var in instr.defs if var in function.value_indices}
         elif isinstance(instr, Phi):
             # Phi instructions define their destination
             # Uses come from incoming values, but those are handled at block boundaries
-            instr_uses = []
-            instr_defs = [instr.dest]
+            instr_uses_val_idx = set()
+            if instr.dest in function.value_indices:
+                instr_defs_val_idx = {function.value_indices[instr.dest]}
+            else:
+                instr_defs_val_idx = set()
         else:
             # Jump instructions don't use or define variables
-            instr_uses = []
-            instr_defs = []
+            instr_uses_val_idx = set()
+            instr_defs_val_idx = set()
         
         # For each use, if last use, free the color
-        for use_var in instr_uses:
-            if is_last_use(use_var, block, i, function):
-                if use_var in color_assignment:
-                    assigned.discard(color_assignment[use_var])
+        for use_val_idx in instr_uses_val_idx:
+            if is_last_use(use_val_idx, block, i, function):
+                if use_val_idx in color_assignment:
+                    assigned.discard(color_assignment[use_val_idx])
         
         # For each def, assign a color from available colors
-        for def_var in instr_defs:
+        for def_val_idx in instr_defs_val_idx:
             available = set(range(k)) - assigned
             if not available:
                 # No available colors - try to free a color from a dead variable or one that will be spilled
@@ -870,8 +852,8 @@ def color_recursive(block_name: str, k: int, color_assignment: Dict[str, int],
                 # We can free its color now (but keep it in color_assignment for potential reload)
                 spills_after = get_spills_at(spills_reloads, block_name, i + 1)
                 for spill in spills_after:
-                    if spill.variable in color_assignment:
-                        color_val = color_assignment[spill.variable]
+                    if spill.val_idx in color_assignment:
+                        color_val = color_assignment[spill.val_idx]
                         if color_val in assigned:
                             # This variable will be spilled right after, free its color now
                             # Keep it in color_assignment in case it's reloaded later
@@ -881,18 +863,14 @@ def color_recursive(block_name: str, k: int, color_assignment: Dict[str, int],
                 
                 # If still no available colors, try to free a color from a dead variable
                 if not available:
-                    for var, color_val in sorted(color_assignment.items(), key=lambda x: x[1]):
+                    for val_idx, color_val in sorted(color_assignment.items(), key=lambda x: x[1]):
                         if color_val in assigned:
-                            # Check if this variable is dead (convert name to val_idx)
+                            # Check if this variable is dead
                             is_dead = False
-                            if var in function.value_indices:
-                                val_idx = function.value_indices[var]
-                                if isinstance(block.live_out, dict):
-                                    is_dead = val_idx not in block.live_out
-                                elif isinstance(block.live_out, set):
-                                    is_dead = val_idx not in block.live_out
-                                else:
-                                    is_dead = True
+                            if isinstance(block.live_out, dict):
+                                is_dead = val_idx not in block.live_out
+                            elif isinstance(block.live_out, set):
+                                is_dead = val_idx not in block.live_out
                             else:
                                 is_dead = True
                             
@@ -900,13 +878,17 @@ def color_recursive(block_name: str, k: int, color_assignment: Dict[str, int],
                             if is_dead:
                                 for j in range(i + 1, len(block.instructions)):
                                     next_instr = block.instructions[j]
-                                    if isinstance(next_instr, Op) and var in next_instr.uses:
-                                        is_dead = False
+                                    if isinstance(next_instr, Op):
+                                        for use_var in next_instr.uses:
+                                            if use_var in function.value_indices and function.value_indices[use_var] == val_idx:
+                                                is_dead = False
+                                                break
+                                    if not is_dead:
                                         break
                             
                             if is_dead:
                                 # Free this color - remove from assignment and assigned set
-                                del color_assignment[var]
+                                del color_assignment[val_idx]
                                 assigned.discard(color_val)
                                 available.add(color_val)
                                 break
@@ -918,12 +900,12 @@ def color_recursive(block_name: str, k: int, color_assignment: Dict[str, int],
                 # Raise an exception to indicate coloring failure
                 available_colors = set(range(k))
                 raise RuntimeError(
-                    f"Coloring failed: No available color for variable {def_var} "
+                    f"Coloring failed: No available color for variable val_idx={def_val_idx} "
                     f"at instruction {i} in block {block_name}. "
                     f"Available colors: {available_colors}, Assigned colors: {assigned}, "
                     f"k={k}. All {k} registers are occupied and no dead variables found."
                 )
-            color_assignment[def_var] = color
+            color_assignment[def_val_idx] = color
             assigned.add(color)
     
     # Recurse on dominator tree children
@@ -932,7 +914,7 @@ def color_recursive(block_name: str, k: int, color_assignment: Dict[str, int],
         color_recursive(child, k, color_assignment, assigned.copy(), dom_tree, function, spills_reloads)
 
 
-def color_program(function: Function, k: int, spills_reloads: Dict[str, List[SpillReload]]) -> Dict[str, int]:
+def color_program(function: Function, k: int, spills_reloads: Dict[str, List[SpillReload]]) -> Dict[int, int]:
     """
     Color the program using SSA-based register coloring.
     
@@ -945,12 +927,12 @@ def color_program(function: Function, k: int, spills_reloads: Dict[str, List[Spi
         spills_reloads: Dictionary mapping blocks to spill/reload operations
         
     Returns:
-        Dictionary mapping variable names to their assigned colors (0 to k-1)
+        Dictionary mapping value indices to their assigned colors (0 to k-1)
     """
     from dominators import find_entry_block, build_dominator_tree, compute_dominators
     
     # Initialize color assignment dictionary (ρ)
-    color_assignment: Dict[str, int] = {}
+    color_assignment: Dict[int, int] = {}
     
     # Find entry block
     entry_block = find_entry_block(function)

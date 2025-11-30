@@ -660,7 +660,11 @@ def is_variable_live(block_name: str, var: str, instr_idx: int, function, spill_
     
     # Check next-use distance first - if finite, variable is live at this point
     # Use the mapped instruction index from original IR
-    next_use_dist = get_next_use_distance(block, var, original_instr_idx, function)
+    if var in function.value_indices:
+        val_idx = function.value_indices[var]
+        next_use_dist = get_next_use_distance(block, val_idx, original_instr_idx, function)
+    else:
+        next_use_dist = float('inf')
     if next_use_dist != float('inf'):
         return True
     
