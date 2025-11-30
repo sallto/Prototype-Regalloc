@@ -433,6 +433,150 @@ def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
     return cand | add, liveThrough
 
 
+def collect_phi_incoming_values(block: Block, pred_name: str, function: Function, pred_W_exit: Set[int]) -> Tuple[Set[int], Set[int]]:
+    """
+    Collect phi incoming value indices from a specific predecessor and from other predecessors.
+    
+    Args:
+        block: The block containing phi nodes
+        pred_name: Name of the predecessor to collect values from
+        function: Function containing value_indices mapping
+        pred_W_exit: Set of value indices in registers at predecessor exit
+        
+    Returns:
+        Tuple containing:
+        - Set of phi incoming value indices from this predecessor that are in pred_W_exit
+        - Set of phi incoming value indices from other predecessors
+    """
+    phi_incoming_val_indices_from_pred = set()
+    phi_incoming_val_indices_from_other_preds = set()
+    
+    for phi in block.phis():
+        incoming_val = phi.incoming_val_for_block(pred_name)
+        if incoming_val is not None and incoming_val in function.value_indices:
+            incoming_val_idx = function.value_indices[incoming_val]
+            # If this incoming value comes from this predecessor and is already in that predecessor's W_exit
+            if incoming_val_idx in pred_W_exit:
+                phi_incoming_val_indices_from_pred.add(incoming_val_idx)
+        # Collect incoming values from other predecessors
+        for other_pred in block.predecessors:
+            if other_pred != pred_name:
+                other_incoming_val = phi.incoming_val_for_block(other_pred)
+                if other_incoming_val is not None and other_incoming_val in function.value_indices:
+                    phi_incoming_val_indices_from_other_preds.add(function.value_indices[other_incoming_val])
+    
+    return phi_incoming_val_indices_from_pred, phi_incoming_val_indices_from_other_preds
+
+
+def compute_reload_vars(W_entry: Set[int], pred_W_exit: Set[int], block: Block,
+                       vars_available_from_all: Set[int], phi_vals_from_pred: Set[int],
+                       phi_vals_from_others: Set[int]) -> Set[int]:
+    """
+    Compute variables that need to be reloaded at a block boundary.
+    
+    Args:
+        W_entry: Set of value indices that should be in registers at block entry
+        pred_W_exit: Set of value indices in registers at predecessor exit
+        block: The block being entered
+        vars_available_from_all: Variables available from all processed predecessors
+        phi_vals_from_pred: Phi incoming values from this predecessor
+        phi_vals_from_others: Phi incoming values from other predecessors
+        
+    Returns:
+        Set of value indices that need to be reloaded
+    """
+    # Reload: All variables in W_entry \ W_exit_pred (excluding phi destinations)
+    # But skip variables that are available from all predecessors (they don't need reloads)
+    # Also skip phi incoming values that are already available from this specific predecessor
+    # And skip phi incoming values that come from other predecessors (not needed from this edge)
+    # block.phi_defs and block.def_set are already val_idx
+    return ((W_entry - pred_W_exit) - block.phi_defs) - vars_available_from_all - phi_vals_from_pred - phi_vals_from_others - block.def_set
+
+
+def collect_phi_incoming_values_for_back_edge(block_name: str, succ_block: Block, function: Function) -> Set[int]:
+    """
+    Collect phi incoming value indices from a block for a successor (used in second pass).
+    
+    Args:
+        block_name: Name of the block providing incoming values
+        succ_block: The successor block containing phi nodes
+        function: Function containing value_indices mapping
+        
+    Returns:
+        Set of phi incoming value indices from this block
+    """
+    phi_incoming_val_indices = set()
+    for phi in succ_block.phis():
+        incoming_val = phi.incoming_val_for_block(block_name)
+        if incoming_val is not None and incoming_val in function.value_indices:
+            phi_incoming_val_indices.add(function.value_indices[incoming_val])
+    return phi_incoming_val_indices
+
+
+def insert_coupling_code_for_edge(pred_name: str, block_name: str, W_entry: Set[int], S_entry: Set[int],
+                                  pred_W_exit: Set[int], pred_S_exit: Set[int], pred_block: Block,
+                                  block: Block, function: Function, result: Dict[str, List[SpillReload]],
+                                  vars_available_from_all: Set[int], k: int) -> None:
+    """
+    Insert coupling code (spills/reloads) for an edge between predecessor and block.
+    
+    This handles:
+    1. Reloading variables needed in block but not in predecessor's registers
+    2. Spilling variables if reloading would exceed k registers
+    3. Spilling variables that are in S_entry but not in pred_S_exit
+    
+    Args:
+        pred_name: Name of the predecessor block
+        block_name: Name of the current block
+        W_entry: Set of value indices that should be in registers at block entry
+        S_entry: Set of value indices spilled at block entry
+        pred_W_exit: Set of value indices in registers at predecessor exit
+        pred_S_exit: Set of value indices spilled at predecessor exit
+        pred_block: The predecessor block object
+        block: The current block object
+        function: Function containing value_indices mapping
+        result: Dictionary mapping block names to lists of SpillReload operations
+        vars_available_from_all: Variables available from all processed predecessors
+        k: Number of available registers
+    """
+    # Collect phi incoming values
+    phi_vals_from_pred, phi_vals_from_others = collect_phi_incoming_values(block, pred_name, function, pred_W_exit)
+    
+    # Compute variables that need reloading
+    reload_vars = compute_reload_vars(W_entry, pred_W_exit, block, vars_available_from_all,
+                                     phi_vals_from_pred, phi_vals_from_others)
+    
+    # Check if reloading would exceed k registers
+    # After reloads, we'll have: pred_W_exit ∪ reload_vars
+    W_after_reload = (pred_W_exit | reload_vars) - pred_S_exit
+    if len(W_after_reload) > k:
+        # Need to spill some variables from pred_W_exit to make room for reloads
+        # Compute how many we need to spill
+        num_to_spill = len(W_after_reload) - k
+        
+        # Sort variables in pred_W_exit by next-use distance in the current block
+        # Use the first instruction index (0) as reference point
+        sorted_pred_vars = sorted(pred_W_exit, key=lambda v: (get_next_use_distance(block, v, 0, function), v))
+        
+        # Spill the variables with furthest next use (last in sorted list)
+        vars_to_spill_for_reloads = set(sorted_pred_vars[-num_to_spill:])
+        
+        # Insert spills before reloads
+        for val_idx in vars_to_spill_for_reloads:
+            if get_next_use_distance(block, val_idx, 0, function) != math.inf:
+                insert_spill_reload_sorted(result[pred_name], SpillReload("spill", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+    
+    # Insert reload operations
+    for val_idx in reload_vars:
+        insert_spill_reload_sorted(result[pred_name], SpillReload("reload", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+
+    # Spill: All variables in (S_entry \ S_exit_pred) ∩ W_exit_pred
+    spill_vars = ((S_entry - pred_S_exit) & pred_W_exit)
+    for val_idx in spill_vars:
+        if get_next_use_distance(block, val_idx, 0, function) != math.inf:
+            insert_spill_reload_sorted(result[pred_name], SpillReload("spill", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+
+
 def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: int = 3) -> Dict[str, List[SpillReload]]:
     """
     Implement the Min algorithm for register allocation with spilling across multiple blocks.
@@ -505,59 +649,10 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
             pred_S_exit = S_exit_map.get(pred_name, set())
             pred_block = function.blocks[pred_name]
 
-            # Collect phi incoming values that come from this specific predecessor and are already available
-            phi_incoming_val_indices_from_pred = set()
-            # Also collect ALL phi incoming values that come from OTHER predecessors (don't need them from this edge)
-            phi_incoming_val_indices_from_other_preds = set()
-            for phi in block.phis():
-                incoming_val = phi.incoming_val_for_block(pred_name)
-                if incoming_val is not None and incoming_val in function.value_indices:
-                    incoming_val_idx = function.value_indices[incoming_val]
-                    # If this incoming value comes from this predecessor and is already in that predecessor's W_exit
-                    if incoming_val_idx in pred_W_exit:
-                        phi_incoming_val_indices_from_pred.add(incoming_val_idx)
-                # Collect incoming values from other predecessors
-                for other_pred in block.predecessors:
-                    if other_pred != pred_name:
-                        other_incoming_val = phi.incoming_val_for_block(other_pred)
-                        if other_incoming_val is not None and other_incoming_val in function.value_indices:
-                            phi_incoming_val_indices_from_other_preds.add(function.value_indices[other_incoming_val])
-
-            # Reload: All variables in W_entry \ W_exit_pred (excluding phi destinations)
-            # But skip variables that are available from all predecessors (they don't need reloads)
-            # Also skip phi incoming values that are already available from this specific predecessor
-            # And skip phi incoming values that come from other predecessors (not needed from this edge)
-            # block.phi_defs and block.def_set are already val_idx
-            reload_vars = ((W_entry - pred_W_exit) - block.phi_defs) - vars_available_from_all - phi_incoming_val_indices_from_pred - phi_incoming_val_indices_from_other_preds - block.def_set
-            
-            # Check if reloading would exceed k registers
-            # After reloads, we'll have: pred_W_exit ∪ reload_vars
-            W_after_reload = (pred_W_exit | reload_vars )- pred_S_exit
-            if len(W_after_reload) > k:
-                # Need to spill some variables from pred_W_exit to make room for reloads
-                # Compute how many we need to spill
-                num_to_spill = len(W_after_reload) - k
-                
-                # Sort variables in pred_W_exit by next-use distance in the current block
-                # Use the first instruction index (0) as reference point
-                sorted_pred_vars = sorted(pred_W_exit, key=lambda v: (get_next_use_distance(block, v, 0, function), v))
-                
-                # Spill the variables with furthest next use (last in sorted list)
-                vars_to_spill_for_reloads = set(sorted_pred_vars[-num_to_spill:])
-                
-                # Insert spills before reloads
-                for val_idx in vars_to_spill_for_reloads:
-                    if get_next_use_distance(block, val_idx, 0, function) != math.inf:
-                        insert_spill_reload_sorted(result[pred_name], SpillReload("spill", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
-            
-            for val_idx in reload_vars:
-                insert_spill_reload_sorted(result[pred_name], SpillReload("reload", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
-
-            # Spill: All variables in (S_entry \ S_exit_pred) ∩ W_exit_pred
-            spill_vars = ((S_entry - pred_S_exit) & pred_W_exit)
-            for val_idx in spill_vars:
-                if get_next_use_distance(block, val_idx, 0, function) != math.inf:
-                    insert_spill_reload_sorted(result[pred_name], SpillReload("spill", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
+            # Insert coupling code for this edge
+            insert_coupling_code_for_edge(pred_name, block_name, W_entry, S_entry,
+                                         pred_W_exit, pred_S_exit, pred_block, block,
+                                         function, result, vars_available_from_all, k)
 
         # Process block instructions starting with W = W_entry, S = S_entry
         W = W_entry
@@ -611,12 +706,8 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
         for succ_name in block.successors:
             succ_block = function.blocks[succ_name]
 
-            # Check if this successor has phi nodes that need incoming values from this block
-            phi_incoming_val_indices = set()
-            for phi in succ_block.phis():
-                incoming_val = phi.incoming_val_for_block(block_name)
-                if incoming_val is not None and incoming_val in function.value_indices:
-                    phi_incoming_val_indices.add(function.value_indices[incoming_val])
+            # Collect phi incoming values from this block
+            phi_incoming_val_indices = collect_phi_incoming_values_for_back_edge(block_name, succ_block, function)
 
             # Reload phi incoming values that aren't in registers at this block's exit
             phi_reload_val_indices = phi_incoming_val_indices - block_W_exit
