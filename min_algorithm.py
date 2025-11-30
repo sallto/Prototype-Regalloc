@@ -492,11 +492,8 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
         # Insert coupling code for each predecessor that has already been processed
         # First, compute which variables are available from ALL processed predecessors
         processed_preds = [p for p in block.predecessors if p in W_exit_map]
-        if processed_preds:
-            # Variables available from all processed predecessors don't need reloads
-            vars_available_from_all = set.intersection(*[W_exit_map[p] for p in processed_preds]) if processed_preds else set()
-        else:
-            vars_available_from_all = set()
+        vars_available_from_all = set.intersection(*[W_exit_map[p] for p in processed_preds]) if processed_preds else set()
+
         
         for pred_name in block.predecessors:
             # Only insert coupling code if the predecessor has been processed
@@ -557,14 +554,14 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
                 insert_spill_reload_sorted(result[pred_name], SpillReload("reload", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
             # Spill: All variables in (S_entry \ S_exit_pred) ∩ W_exit_pred
-            spill_vars = ((S_entry - pred_S_exit) & pred_W_exit) #| ((pred_W_exit - pred_S_exit - W_entry) & block.live_in.keys())
+            spill_vars = ((S_entry - pred_S_exit) & pred_W_exit)
             for val_idx in spill_vars:
                 if get_next_use_distance(block, val_idx, 0, function) != math.inf:
                     insert_spill_reload_sorted(result[pred_name], SpillReload("spill", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
         # Process block instructions starting with W = W_entry, S = S_entry
-        W = W_entry.copy()
-        S = S_entry.copy()
+        W = W_entry
+        S = S_entry
 
         for insn_idx, instr in enumerate(block.instructions):
             # Get uses and defs for this instruction (convert to val_idx)
@@ -575,14 +572,10 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
                 # Phi instructions define their destination but don't use variables directly
                 # (uses come from incoming values, handled at block boundaries)
                 instr_uses_val_idx = set()
-                if instr.dest in function.value_indices:
-                    instr_defs_val_idx = {function.value_indices[instr.dest]}
-                else:
-                    instr_defs_val_idx = set()
+
+                instr_defs_val_idx = {function.value_indices[instr.dest]}
             else:
-                # Jump instructions don't use or define variables directly
-                instr_uses_val_idx = set()
-                instr_defs_val_idx = set()
+                continue
 
             # R = uses that are not already in registers (need reload)
             R = instr_uses_val_idx - W
