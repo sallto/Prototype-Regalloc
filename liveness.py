@@ -1,6 +1,6 @@
 # todo: non reducible control flow
-import heapq
 import math
+from collections import deque
 from typing import List, Dict, Set, Tuple
 from dataclasses import dataclass
 from ir import Function, Block, Op, Phi, val_as_phi, get_val_name
@@ -14,19 +14,6 @@ class LoopNode:
     is_loop: bool  # True if this represents a loop header
     children: List["LoopNode"]
     parent: "LoopNode" = None
-
-
-@dataclass
-class LoopAnalysisInfo:
-    """Metadata needed to propagate next-use distances inside a loop."""
-
-    header: str
-    blocks: Set[str]
-    block_lengths: Dict[str, int]
-    succs_in_loop: Dict[str, List[str]]
-    preds_in_loop: Dict[str, List[str]]
-    local_uses: Dict[str, Dict[int, float]]
-    best_entry: Dict[str, Dict[int, float]] = None
 
 
 def compute_predecessors_and_use_def_sets(function: Function) -> None:
@@ -199,97 +186,6 @@ def expand_loop_blocks(
     return members
 
 
-def compute_block_local_uses(
-    function: Function, block_name: str, in_loop_successors: List[str]
-) -> Dict[int, float]:
-    """
-    Collect the earliest use distance for each variable (by val_idx) within the given block
-    as well as phi-uses that occur immediately in successor blocks.
-    """
-    block = function.blocks[block_name]
-    local_uses: Dict[int, float] = {}
-
-    for idx, instr in enumerate(block.instructions):
-        if isinstance(instr, Op):
-            for use in instr.uses:
-                if use in function.value_indices:
-                    use_idx = function.value_indices[use]
-                    prev = local_uses.get(use_idx, math.inf)
-                    if idx < prev:
-                        local_uses[use_idx] = idx
-
-    block_len = len(block.instructions)
-    for succ in in_loop_successors:
-        succ_block = function.blocks[succ]
-        for instr in succ_block.instructions:
-            if isinstance(instr, Phi):
-                for incoming in instr.incomings:
-                    if incoming.block == block_name:
-                        var = incoming.value
-                        if var in function.value_indices:
-                            val_idx = function.value_indices[var]
-                            prev = local_uses.get(val_idx, math.inf)
-                            if block_len < prev:
-                                local_uses[val_idx] = block_len
-
-    return local_uses
-
-
-def gather_loop_analysis(
-    function: Function,
-    loop_forest: Dict[str, LoopNode],
-    loop_edges: Set[Tuple[str, str]],
-) -> Dict[str, LoopAnalysisInfo]:
-    """
-    Build metadata for each loop needed to propagate next-use distances.
-    """
-    loop_infos: Dict[str, LoopAnalysisInfo] = {}
-
-    for block_name, node in loop_forest.items():
-        if not node.is_loop or block_name not in function.blocks:
-            continue
-
-        blocks = expand_loop_blocks(block_name, loop_edges, function)
-        if not blocks:
-            continue
-
-        block_lengths = {
-            name: len(function.blocks[name].instructions)
-            for name in blocks
-            if name in function.blocks
-        }
-        succs_in_loop: Dict[str, List[str]] = {}
-        preds_in_loop: Dict[str, List[str]] = {name: [] for name in blocks}
-
-        for name in blocks:
-            block = function.blocks.get(name)
-            if not block:
-                continue
-            in_loop_successors = [succ for succ in block.successors if succ in blocks]
-            succs_in_loop[name] = in_loop_successors
-            for succ in in_loop_successors:
-                preds_in_loop.setdefault(succ, []).append(name)
-
-        local_uses = {
-            name: compute_block_local_uses(
-                function, name, succs_in_loop.get(name, [])
-            )
-            for name in blocks
-            if name in function.blocks
-        }
-
-        loop_infos[block_name] = LoopAnalysisInfo(
-            header=block_name,
-            blocks=blocks,
-            block_lengths=block_lengths,
-            succs_in_loop=succs_in_loop,
-            preds_in_loop=preds_in_loop,
-            local_uses=local_uses,
-        )
-
-    return loop_infos
-
-
 def get_loop_processing_order(loop_forest: Dict[str, LoopNode]) -> List[str]:
     """
     Produce a list of loop headers in bottom-up order (children before parents).
@@ -311,89 +207,6 @@ def get_loop_processing_order(loop_forest: Dict[str, LoopNode]) -> List[str]:
             dfs(node)
 
     return order
-
-
-def compute_loop_best_entries(
-    loop_infos: Dict[str, LoopAnalysisInfo], loop_forest: Dict[str, LoopNode]
-) -> None:
-    """
-    For each loop, compute the minimal distances from every block entry to the
-    next use that stays within the same loop body.
-    """
-    order = get_loop_processing_order(loop_forest)
-
-    for header in order:
-        info = loop_infos.get(header)
-        if not info:
-            continue
-
-        best: Dict[str, Dict[int, float]] = {block: {} for block in info.blocks}
-        heap: List[Tuple[float, str, int]] = []
-
-        for block in info.blocks:
-            uses = dict(info.local_uses.get(block, {}))
-            if block in loop_infos and block != header:
-                child_info = loop_infos[block]
-                if child_info.best_entry and child_info.best_entry.get(block):
-                    for val_idx, dist in child_info.best_entry[block].items():
-                        prev = uses.get(val_idx, math.inf)
-                        if dist < prev:
-                            uses[val_idx] = dist
-
-            for val_idx, dist in uses.items():
-                if math.isinf(dist):
-                    continue
-                if dist < best[block].get(val_idx, math.inf):
-                    best[block][val_idx] = dist
-                    heapq.heappush(heap, (dist, block, val_idx))
-
-        while heap:
-            dist, block, val_idx = heapq.heappop(heap)
-            if dist != best[block][val_idx]:
-                continue
-            for pred in info.preds_in_loop.get(block, []):
-                block_len = info.block_lengths.get(pred, 0)
-                new_dist = dist + block_len
-                if new_dist < best[pred].get(val_idx, math.inf):
-                    best[pred][val_idx] = new_dist
-                    heapq.heappush(heap, (new_dist, pred, val_idx))
-
-        info.best_entry = best
-
-
-def apply_loop_best_entries(
-    function: Function, loop_infos: Dict[str, LoopAnalysisInfo]
-) -> None:
-    """
-    Push the computed loop distances back into each block's live_in/out sets.
-    """
-    for info in loop_infos.values():
-        if not info.best_entry:
-            continue
-        # Collect all val_idx defined within this loop
-        loop_def_vars = set()
-        for block_name in info.blocks:
-            block = function.blocks.get(block_name)
-            if block:
-                loop_def_vars.update(block.def_set)
-                loop_def_vars.update(block.phi_defs)
-
-        for block_name, entry_map in info.best_entry.items():
-            block = function.blocks.get(block_name)
-            if not block:
-                continue
-            block_len = info.block_lengths.get(block_name, 0)
-            for val_idx, dist in entry_map.items():
-                # Don't propagate variables that are defined within the loop
-                # to any block within the loop
-                if val_idx in loop_def_vars:
-                    continue
-                if dist < block.live_in.get(val_idx, math.inf):
-                    block.live_in[val_idx] = dist
-                if dist >= block_len:
-                    exit_dist = dist - block_len
-                    if exit_dist < block.live_out.get(val_idx, math.inf):
-                        block.live_out[val_idx] = exit_dist
 
 
 def compute_loop_exit_edges(
@@ -748,16 +561,84 @@ def propagate_loop_liveness_and_distances(
     for root in roots:
         loop_tree_dfs(root)
 
-    # Compute loop-aware next-use distances
+    # Compute loop-aware next-use distances using BFS
     if loop_membership:
-        loop_infos = gather_loop_analysis(function, loop_forest, loop_edges)
-        if loop_infos:
-            compute_loop_best_entries(loop_infos, loop_forest)
-            apply_loop_best_entries(function, loop_infos)
-
-            # Add blocks affected by distance computation
-            for info in loop_infos.values():
-                affected_blocks.update(info.blocks)
+        # Process loops in bottom-up order (inner loops first)
+        loop_order = get_loop_processing_order(loop_forest)
+        
+        for header in loop_order:
+            blocks = loop_membership.get(header, set())
+            if not blocks or header not in function.blocks:
+                continue
+            
+            header_block = function.blocks[header]
+            # Collect all live variables in this loop
+            loop_live_vars = set(header_block.live_in.keys())
+            loop_live_vars.update(header_block.live_out.keys())
+            
+            # Also collect from nested loops
+            for child_node in loop_forest[header].children:
+                if child_node.is_loop:
+                    child_block = function.blocks[child_node.block_name]
+                    loop_live_vars.update(child_block.live_in.keys())
+                    loop_live_vars.update(child_block.live_out.keys())
+            
+            # BFS from header to find minimum distance to first use of each live variable
+            min_dist: Dict[int, float] = {}
+            visited = set()
+            queue = deque([(header, 0)])  # (block_name, distance_from_header_entry)
+            
+            while queue:
+                block_name, dist = queue.popleft()
+                if block_name in visited or block_name not in blocks or block_name not in function.blocks:
+                    continue
+                visited.add(block_name)
+                
+                block = function.blocks[block_name]
+                block_len = len(block.instructions)
+                
+                # Check uses in this block's instructions
+                for idx, instr in enumerate(block.instructions):
+                    if isinstance(instr, Op):
+                        for use in instr.uses:
+                            if use in function.value_indices:
+                                val_idx = function.value_indices[use]
+                                if val_idx in loop_live_vars:
+                                    use_dist = dist + idx
+                                    if val_idx not in min_dist or use_dist < min_dist[val_idx]:
+                                        min_dist[val_idx] = use_dist
+                
+                # Check phi uses in successor blocks (within loop)
+                for succ in block.successors:
+                    if succ in blocks and succ in function.blocks:
+                        succ_block = function.blocks[succ]
+                        for instr in succ_block.instructions:
+                            if isinstance(instr, Phi):
+                                for incoming in instr.incomings:
+                                    if incoming.block == block_name:
+                                        var = incoming.value
+                                        if var in function.value_indices:
+                                            val_idx = function.value_indices[var]
+                                            if val_idx in loop_live_vars:
+                                                # Phi use is at distance block_len from block entry
+                                                use_dist = dist + block_len
+                                                if val_idx not in min_dist or use_dist < min_dist[val_idx]:
+                                                    min_dist[val_idx] = use_dist
+                
+                # Add successors within loop to queue
+                for succ in block.successors:
+                    if succ in blocks and succ not in visited:
+                        queue.append((succ, dist + block_len))
+            
+            # Update header's live_in with computed minimum distances
+            # Only update variables that are not defined in the header
+            for val_idx, d in min_dist.items():
+                if val_idx not in header_block.def_set and val_idx not in header_block.phi_defs:
+                    if d < header_block.live_in.get(val_idx, math.inf):
+                        header_block.live_in[val_idx] = d
+            
+            # Mark all loop blocks for recomputation
+            affected_blocks.update(blocks)
 
     # Recompute distances for all affected blocks in postorder
     if affected_blocks:
