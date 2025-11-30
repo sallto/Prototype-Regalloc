@@ -1086,7 +1086,7 @@ def test_parser(ir_file: str, k: int = 3) -> None:
 
         # Compute liveness
         print("Computing liveness analysis...")
-        liveness.compute_liveness(function)
+        loop_membership = liveness.compute_liveness(function)
         print("Liveness analysis completed!")
 
 
@@ -1112,7 +1112,7 @@ def test_parser(ir_file: str, k: int = 3) -> None:
 
         # Run the Min algorithm for register allocation
         print(f"Running Min algorithm with k={k}...")
-        spills_reloads = min_algorithm.min_algorithm(function, k=k)
+        spills_reloads = min_algorithm.min_algorithm(function, loop_membership, k=k)
         print("Min algorithm completed!")
         print()
 

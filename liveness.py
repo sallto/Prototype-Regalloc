@@ -309,7 +309,7 @@ def recompute_block_live_sets(
         block.live_in[val_idx] = float("inf")
 
     # Initialize per-value use position collection
-    value_uses: Dict[int, List[int]] = {}
+    block.next_use_distances_by_val = {}
 
     # Process instructions in reverse to compute actual use distances
     block_len = len(block.instructions)
@@ -336,9 +336,9 @@ def recompute_block_live_sets(
                     if use_idx in block.live_in:
                         block.live_in[use_idx] = min(block.live_in[use_idx], i)
                     # Collect use positions for per-value analysis (all uses, not just live_in)
-                    if use_idx not in value_uses:
-                        value_uses[use_idx] = []
-                    value_uses[use_idx].append(i)
+                    if use_idx not in block.next_use_distances_by_val:
+                        block.next_use_distances_by_val[use_idx] = []
+                    block.next_use_distances_by_val[use_idx].append(i)
 
             # Update register pressure: variables live at this point include live_set plus defs and uses
             # live_set currently contains variables that are live after this instruction
@@ -361,9 +361,9 @@ def recompute_block_live_sets(
                     if use_idx in block.live_in:
                         block.live_in[use_idx] = min(block.live_in[use_idx], i)
                     # Collect phi incoming values as uses (all uses, not just live_in)
-                    if use_idx not in value_uses:
-                        value_uses[use_idx] = []
-                    value_uses[use_idx].append(i)
+                    if use_idx not in block.next_use_distances_by_val:
+                        block.next_use_distances_by_val[use_idx] = []
+                    block.next_use_distances_by_val[use_idx].append(i)
 
             # Update register pressure: variables live at this point include live_set plus defs and uses
             # live_set currently contains variables that are live after this instruction
@@ -381,23 +381,19 @@ def recompute_block_live_sets(
         if dist >= block_len and val_idx in block.live_out:
             block.live_in[val_idx] = block.live_out[val_idx] + block_len
 
-    # Convert collected use positions to next_use_distances_by_val
-    block.next_use_distances_by_val = {}
-
-    # Process value_uses (now keyed by val_idx) and store in block.next_use_distances_by_val
-    for val_idx, use_positions in value_uses.items():
+    # Finalize next_use_distances_by_val: sort and append live_out distances
+    for val_idx, use_positions in block.next_use_distances_by_val.items():
         # Sort to get chronological order (since we collected in reverse)
-        sorted_positions = sorted(use_positions)
+        use_positions.sort()
         # Add liveout distance as the last entry (using final live_out values after propagation)
         if isinstance(block.live_out, dict) and val_idx in block.live_out:
             # live_out[val_idx] is distance from block exit, so add block_len to get distance from start
-            sorted_positions.append(block_len + block.live_out[val_idx])
+            use_positions.append(block_len + block.live_out[val_idx])
         else:
             # Not live out, append infinity as the last entry
-            sorted_positions.append(math.inf)
-        block.next_use_distances_by_val[val_idx] = sorted_positions
+            use_positions.append(math.inf)
 
-    # Handle variables that are in live_out but didn't appear in value_uses
+    # Handle variables that are in live_out but didn't appear in next_use_distances_by_val
     if isinstance(block.live_out, dict):
         for val_idx in block.live_out:
             # Only add if not already processed above
@@ -607,12 +603,15 @@ def get_next_use_distance(block: Block, var: str, current_idx: int, function: Fu
 
 
 
-def compute_liveness(function: Function) -> None:
+def compute_liveness(function: Function) -> Dict[str, Set[str]]:
     """
     Main function that orchestrates the two-phase liveness analysis.
 
     Args:
         function: The Function object to analyze
+
+    Returns:
+        Dictionary mapping loop headers to sets of blocks in each loop (loop_membership)
     """
     # Phase 0: Setup
     compute_predecessors_and_use_def_sets(function)
@@ -625,5 +624,7 @@ def compute_liveness(function: Function) -> None:
 
     # Phase 2: Loop propagation and distance computation
     propagate_loop_liveness_and_distances(function, loop_forest, loop_edges, loop_membership, exit_edges, postorder)
+
+    return loop_membership
 
 

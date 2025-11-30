@@ -14,7 +14,7 @@ import bisect
 from typing import Dict, List, Set, Union, Tuple
 from dataclasses import dataclass
 from ir import Function, Block, Op, Jump, Phi
-from liveness import compute_liveness, build_loop_forest, get_next_use_distance
+from liveness import get_next_use_distance
 from collections import defaultdict
 
 def topological_order(function: Function) -> List[str]:
@@ -447,7 +447,7 @@ def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
     return cand | add, liveThrough
 
 
-def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]]:
+def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: int = 3) -> Dict[str, List[SpillReload]]:
     """
     Implement the Min algorithm for register allocation with spilling across multiple blocks.
 
@@ -456,6 +456,7 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
 
     Args:
         function: Function to perform register allocation on
+        loop_membership: Dictionary mapping loop headers to sets of blocks in each loop
         k: Number of available registers (default 3)
 
     Returns:
@@ -466,9 +467,6 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
 
     # Get blocks in topological order
     block_order = topological_order(function)
-
-    # Build loop membership information
-    _, _, loop_membership, _, _ = build_loop_forest(function)
 
     # Track W_exit and S_exit for each block
     W_exit_map = {}  # block_name -> set of variables in registers at exit
