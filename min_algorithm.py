@@ -199,11 +199,10 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function:
     # For phi nodes, ensure incoming values are considered for W_entry
     # Add phi incoming values that are available from their predecessors
     phi_vars = set()
-    for instr in block.instructions:
-        if isinstance(instr, Phi):
-            for incoming in instr.incomings:
-                if incoming.block in pred_W_exits and incoming.value in pred_W_exits[incoming.block]:
-                    phi_vars.add(incoming.value)
+    for phi in block.phis():
+        for incoming in phi.incomings:
+            if incoming.block in pred_W_exits and incoming.value in pred_W_exits[incoming.block]:
+                phi_vars.add(incoming.value)
 
     # Add phi vars to candidates with frequency equal to number of predecessors they come from
     # (but actually, for initUsual, we want phi vars that are available)
@@ -525,15 +524,14 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             phi_incoming_vars_from_pred = set()
             # Also collect ALL phi incoming values that come from OTHER predecessors (don't need them from this edge)
             phi_incoming_vars_from_other_preds = set()
-            for instr in block.instructions:
-                if isinstance(instr, Phi):
-                    for incoming in instr.incomings:
-                        # If this incoming value comes from this predecessor and is already in that predecessor's W_exit
-                        if incoming.block == pred_name and incoming.value in pred_W_exit:
-                            phi_incoming_vars_from_pred.add(incoming.value)
-                        # If this incoming value comes from a different predecessor, we don't need it from this edge
-                        elif incoming.block != pred_name:
-                            phi_incoming_vars_from_other_preds.add(incoming.value)
+            for phi in block.phis():
+                for incoming in phi.incomings:
+                    # If this incoming value comes from this predecessor and is already in that predecessor's W_exit
+                    if incoming.block == pred_name and incoming.value in pred_W_exit:
+                        phi_incoming_vars_from_pred.add(incoming.value)
+                    # If this incoming value comes from a different predecessor, we don't need it from this edge
+                    elif incoming.block != pred_name:
+                        phi_incoming_vars_from_other_preds.add(incoming.value)
 
             # Reload: All variables in W_entry \ W_exit_pred (excluding phi destinations)
             # But skip variables that are available from all predecessors (they don't need reloads)
@@ -631,11 +629,10 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
 
             # Check if this successor has phi nodes that need incoming values from this block
             phi_incoming_vars = set()
-            for instr in succ_block.instructions:
-                if isinstance(instr, Phi):
-                    for incoming in instr.incomings:
-                        if incoming.block == block_name:
-                            phi_incoming_vars.add(incoming.value)
+            for phi in succ_block.phis():
+                for incoming in phi.incomings:
+                    if incoming.block == block_name:
+                        phi_incoming_vars.add(incoming.value)
 
             # Reload phi incoming values that aren't in registers at this block's exit
             phi_reload_vars = phi_incoming_vars - block_W_exit

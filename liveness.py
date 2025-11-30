@@ -3,7 +3,7 @@ import math
 from collections import deque
 from typing import List, Dict, Set, Tuple
 from dataclasses import dataclass
-from ir import Function, Block, Op, Phi, val_as_phi, get_val_name
+from ir import Function, Block, Op, Phi, val_as_phi
 
 
 @dataclass
@@ -31,7 +31,23 @@ def compute_predecessors_and_use_def_sets(function: Function) -> None:
         # Track val_idx that have been defined so far in this block
         defined_so_far = set()
 
-        for instr in block.instructions:
+        # Process phi instructions first (they're always at the beginning)
+        phi_count = 0
+        for phi in block.phis():
+            # Add phi destination to phi_defs
+            if phi.dest in function.value_indices:
+                dest_idx = function.value_indices[phi.dest]
+                block.phi_defs.add(dest_idx)
+                defined_so_far.add(dest_idx)
+            # Add all incoming values to phi_uses
+            for incoming in phi.incomings:
+                if incoming.value in function.value_indices:
+                    val_idx = function.value_indices[incoming.value]
+                    function.blocks[incoming.block].phi_uses.add(val_idx)
+            phi_count += 1
+
+        # Process remaining instructions (skip phis since we already processed them)
+        for instr in block.instructions[phi_count:]:
             if isinstance(instr, Op):
                 # Add uses that haven't been defined yet in this block
                 for use in instr.uses:
@@ -45,17 +61,6 @@ def compute_predecessors_and_use_def_sets(function: Function) -> None:
                         def_idx = function.value_indices[def_var]
                         block.def_set.add(def_idx)
                         defined_so_far.add(def_idx)
-            elif isinstance(instr, Phi):
-                # Add phi destination to phi_defs
-                if instr.dest in function.value_indices:
-                    dest_idx = function.value_indices[instr.dest]
-                    block.phi_defs.add(dest_idx)
-                    defined_so_far.add(dest_idx)
-                # Add all incoming values to phi_uses
-                for incoming in instr.incomings:
-                    if incoming.value in function.value_indices:
-                        val_idx = function.value_indices[incoming.value]
-                        function.blocks[incoming.block].phi_uses.add(val_idx)
 
         # Build predecessors from successors
         for successor in block.successors:
@@ -187,30 +192,6 @@ def build_loop_forest(
     return loop_forest, back_edges, loop_membership, exit_edges, postorder
 
 
-def expand_loop_blocks(
-    header: str, loop_edges: Set[Tuple[str, str]], function: Function
-) -> Set[str]:
-    """
-    Expand the loop membership for a header by walking backwards from all tails.
-    """
-    members = {header}
-    tails = [src for src, tgt in loop_edges if tgt == header]
-    stack = list(tails)
-    members.update(tails)
-
-    while stack:
-        current = stack.pop()
-        block = function.blocks.get(current)
-        if not block:
-            continue
-        for pred in block.predecessors:
-            if pred == header:
-                continue
-            if pred not in members and pred in function.blocks:
-                members.add(pred)
-                stack.append(pred)
-    assert(members ==set([src for src, tgt in loop_edges]+[tgt for src, tgt in loop_edges]))
-    return members
 
 
 def get_loop_processing_order(loop_forest: Dict[str, LoopNode]) -> List[str]:
@@ -552,18 +533,17 @@ def propagate_loop_liveness_and_distances(
                 for succ in block.successors:
                     if succ in blocks and succ in function.blocks:
                         succ_block = function.blocks[succ]
-                        for instr in succ_block.instructions:
-                            if isinstance(instr, Phi):
-                                for incoming in instr.incomings:
-                                    if incoming.block == block_name:
-                                        var = incoming.value
-                                        if var in function.value_indices:
-                                            val_idx = function.value_indices[var]
-                                            if val_idx in loop_live_vars:
-                                                # Phi use is at distance block_len from block entry
-                                                use_dist = dist + block_len
-                                                if val_idx not in min_dist or use_dist < min_dist[val_idx]:
-                                                    min_dist[val_idx] = use_dist
+                        for phi in succ_block.phis():
+                            for incoming in phi.incomings:
+                                if incoming.block == block_name:
+                                    var = incoming.value
+                                    if var in function.value_indices:
+                                        val_idx = function.value_indices[var]
+                                        if val_idx in loop_live_vars:
+                                            # Phi use is at distance block_len from block entry
+                                            use_dist = dist + block_len
+                                            if val_idx not in min_dist or use_dist < min_dist[val_idx]:
+                                                min_dist[val_idx] = use_dist
                 
                 # Add successors within loop to queue
                 for succ in block.successors:
@@ -588,74 +568,6 @@ def propagate_loop_liveness_and_distances(
 
 
 
-
-
-
-def check_liveness_correctness(function: Function) -> bool:
-    """
-    Check correctness of liveness analysis by verifying that every variable in LiveOut(B)
-    appears in LiveIn(S) for at least one successor S of B.
-
-    Args:
-        function: The Function object to check
-
-    Returns:
-        bool: True if liveness is correct, False otherwise
-
-    Raises:
-        AssertionError: If liveness correctness check fails with details
-    """
-    errors = []
-
-    for block_name, block in function.blocks.items():
-        # Skip terminal blocks (blocks with no successors) as they don't need to propagate liveness
-        if not block.successors:
-            continue
-
-        for val_idx in block.live_out:
-            found_in_successor = False
-            successor_live_ins = []
-            var_name = get_val_name(function, val_idx)
-
-            for successor in block.successors:
-                if successor in function.blocks:
-                    succ_block = function.blocks[successor]
-                    # Convert val_idx to names for error message
-                    succ_live_in_names = sorted([get_val_name(function, idx) for idx in succ_block.live_in])
-                    successor_live_ins.append(
-                        f"{successor}: {succ_live_in_names}"
-                    )
-                    if val_idx in succ_block.live_in:
-                        found_in_successor = True
-                        break
-                    # Also check if var flows into a phi in this successor from this block
-                    for instr in succ_block.instructions:
-                        if isinstance(instr, Phi):
-                            for incoming in instr.incomings:
-                                if incoming.block == block_name and incoming.value == var_name:
-                                    found_in_successor = True
-                                    break
-                            if found_in_successor:
-                                break
-                    if found_in_successor:
-                        break
-
-            if not found_in_successor:
-                # Convert val_idx to names for error message
-                live_out_names = sorted([get_val_name(function, idx) for idx in block.live_out])
-                error_msg = (
-                    f"Variable '{var_name}' in LiveOut of block '{block_name}' "
-                    f"not found in LiveIn of any successor.\n"
-                    f"  LiveOut({block_name}): {live_out_names}\n"
-                    f"  Successors LiveIn: {successor_live_ins}"
-                )
-                errors.append(error_msg)
-
-    if errors:
-        error_details = "\n\n".join(errors)
-        raise AssertionError(f"Liveness correctness check failed:\n\n{error_details}")
-
-    return True
 
 
 

@@ -230,7 +230,15 @@ def print_function(function: Function, idom: dict = None, dom_tree: dict = None)
         print(f"    LiveIn: {{{live_in_str}}}")
         print(f"    LiveOut: {{{live_out_str}}}")
         print("    Instructions:")
-        for i, instr in enumerate(block.instructions):
+        # Process phi instructions first (they're always at the beginning)
+        phi_count = 0
+        for i, phi in enumerate(block.phis()):
+            incomings_str = ", ".join(f"{inc.block}={inc.value}" for inc in phi.incomings)
+            print(f"      {i}: phi {phi.dest} [{incomings_str}]")
+            phi_count += 1
+        
+        # Process remaining instructions
+        for i, instr in enumerate(block.instructions[phi_count:], start=phi_count):
             if isinstance(instr, Op):
                 uses_str = ", ".join(instr.uses) if instr.uses else "none"
                 defs_str = ", ".join(instr.defs) if instr.defs else "none"
@@ -250,9 +258,6 @@ def print_function(function: Function, idom: dict = None, dom_tree: dict = None)
             elif isinstance(instr, Jump):
                 targets_str = ", ".join(instr.targets)
                 print(f"      {i}: jmp {targets_str}")
-            elif isinstance(instr, Phi):
-                incomings_str = ", ".join(f"{inc.block}={inc.value}" for inc in instr.incomings)
-                print(f"      {i}: phi {instr.dest} [{incomings_str}]")
         print()
 
 
@@ -341,8 +346,23 @@ def print_function_with_spills(function: Function, spills_reloads: Dict[str, Lis
         except StopIteration:
             next_op = None
 
-        # Process each original instruction
-        for instr_idx, instr in enumerate(block.instructions):
+        # Process phi instructions first (they're always at the beginning)
+        phi_count = 0
+        for instr_idx, phi in enumerate(block.phis()):
+            # Print all operations that should appear before this instruction (position == instr_idx)
+            while next_op is not None and next_op.position == instr_idx:
+                print(f"  {next_op.type} {next_op.variable}")
+                try:
+                    next_op = next(op_iter)
+                except StopIteration:
+                    next_op = None
+            
+            incomings_str = ", ".join(f"{inc.block}, {inc.value}" for inc in phi.incomings)
+            print(f"  phi {phi.dest} [{incomings_str}]")
+            phi_count += 1
+        
+        # Process remaining instructions
+        for instr_idx, instr in enumerate(block.instructions[phi_count:], start=phi_count):
             # Print all operations that should appear before this instruction (position == instr_idx)
             while next_op is not None and next_op.position == instr_idx:
                 print(f"  {next_op.type} {next_op.variable}")
@@ -367,9 +387,6 @@ def print_function_with_spills(function: Function, spills_reloads: Dict[str, Lis
             elif isinstance(instr, Jump):
                 targets_str = ",".join(instr.targets)
                 print(f"  jmp {targets_str}")
-            elif isinstance(instr, Phi):
-                incomings_str = ", ".join(f"{inc.block}, {inc.value}" for inc in instr.incomings)
-                print(f"  phi {instr.dest} [{incomings_str}]")
 
         # Handle operations after the last instruction (position >= len(block.instructions))
         while next_op is not None:
@@ -410,8 +427,38 @@ def print_function_with_colors(function: Function, spills_reloads: Dict[str, Lis
         except StopIteration:
             next_op = None
 
-        # Process each original instruction
-        for instr_idx, instr in enumerate(block.instructions):
+        # Process phi instructions first (they're always at the beginning)
+        phi_count = 0
+        for instr_idx, phi in enumerate(block.phis()):
+            # Print all operations that should appear before this instruction (position == instr_idx)
+            while next_op is not None and next_op.position == instr_idx:
+                if next_op.type == "reload":
+                    # Show color for reload operations
+                    color = color_assignment.get(next_op.variable, None)
+                    if color is not None:
+                        print(f"  {next_op.type} {next_op.variable} -> r{color}")
+                    else:
+                        print(f"  {next_op.type} {next_op.variable}")
+                else:
+                    # Spill operations don't need color (they're removing from register)
+                    print(f"  {next_op.type} {next_op.variable}")
+                try:
+                    next_op = next(op_iter)
+                except StopIteration:
+                    next_op = None
+            
+            # Show color for phi destination
+            dest_color = color_assignment.get(phi.dest, None)
+            dest_str = phi.dest
+            if dest_color is not None:
+                dest_str = f"{phi.dest}->r{dest_color}"
+            
+            incomings_str = ", ".join(f"{inc.block}, {inc.value}" for inc in phi.incomings)
+            print(f"  phi {dest_str} [{incomings_str}]")
+            phi_count += 1
+        
+        # Process remaining instructions
+        for instr_idx, instr in enumerate(block.instructions[phi_count:], start=phi_count):
             # Print all operations that should appear before this instruction (position == instr_idx)
             while next_op is not None and next_op.position == instr_idx:
                 if next_op.type == "reload":
@@ -457,15 +504,6 @@ def print_function_with_colors(function: Function, spills_reloads: Dict[str, Lis
             elif isinstance(instr, Jump):
                 targets_str = ",".join(instr.targets)
                 print(f"  jmp {targets_str}")
-            elif isinstance(instr, Phi):
-                # Show color for phi destination
-                dest_color = color_assignment.get(instr.dest, None)
-                dest_str = instr.dest
-                if dest_color is not None:
-                    dest_str = f"{instr.dest}->r{dest_color}"
-                
-                incomings_str = ", ".join(f"{inc.block}, {inc.value}" for inc in instr.incomings)
-                print(f"  phi {dest_str} [{incomings_str}]")
 
         # Handle operations after the last instruction (position >= len(block.instructions))
         while next_op is not None:
@@ -570,8 +608,53 @@ def compute_register_state(function: Function, spills_reloads: Dict[str, List[Sp
         except StopIteration:
             next_op = None
         
-        # Process each instruction
-        for instr_idx, instr in enumerate(block.instructions):
+        # Process phi instructions first (they're always at the beginning)
+        phi_count = 0
+        for instr_idx, phi in enumerate(block.phis()):
+            # Process all operations that should appear before this instruction
+            while next_op is not None and next_op.position == instr_idx:
+                if next_op.type == "spill":
+                    # Variable leaves register
+                    var = next_op.variable
+                    if var in color_assignment:
+                        reg_idx = color_assignment[var]
+                        if register_state[reg_idx] == var:
+                            register_state[reg_idx] = None
+                elif next_op.type == "reload":
+                    # Variable enters register
+                    var = next_op.variable
+                    if var in color_assignment:
+                        reg_idx = color_assignment[var]
+                        register_state[reg_idx] = var
+                try:
+                    next_op = next(op_iter)
+                except StopIteration:
+                    next_op = None
+            
+            # Process phi instruction
+            instr_uses = []
+            instr_defs = [phi.dest]
+            phi_count += 1
+            
+            # Process uses: if last use, free the register
+            for use_var in instr_uses:
+                if is_last_use(use_var, block, instr_idx, function):
+                    if use_var in color_assignment:
+                        reg_idx = color_assignment[use_var]
+                        if register_state[reg_idx] == use_var:
+                            register_state[reg_idx] = None
+            
+            # Process defs: assign register
+            for def_var in instr_defs:
+                if def_var in color_assignment:
+                    reg_idx = color_assignment[def_var]
+                    register_state[reg_idx] = def_var
+            
+            # Store register state after this instruction
+            register_states[(block_name, instr_idx)] = register_state.copy()
+        
+        # Process remaining instructions
+        for instr_idx, instr in enumerate(block.instructions[phi_count:], start=phi_count):
             # Process all operations that should appear before this instruction
             while next_op is not None and next_op.position == instr_idx:
                 if next_op.type == "spill":
@@ -596,9 +679,6 @@ def compute_register_state(function: Function, spills_reloads: Dict[str, List[Sp
             if isinstance(instr, Op):
                 instr_uses = instr.uses
                 instr_defs = instr.defs
-            elif isinstance(instr, Phi):
-                instr_uses = []
-                instr_defs = [instr.dest]
             else:
                 instr_uses = []
                 instr_defs = []
@@ -726,8 +806,76 @@ def print_function_with_register_state(function: Function, spills_reloads: Dict[
         except StopIteration:
             next_op = None
         
-        # Process each original instruction
-        for instr_idx, instr in enumerate(block.instructions):
+        # Process phi instructions first (they're always at the beginning)
+        phi_count = 0
+        for instr_idx, phi in enumerate(block.phis()):
+            # Print all operations that should appear before this instruction (position == instr_idx)
+            while next_op is not None and next_op.position == instr_idx:
+                # Update register state based on operation
+                if next_op.type == "spill":
+                    var = next_op.variable
+                    if var in color_assignment:
+                        reg_idx = color_assignment[var]
+                        if register_state[reg_idx] == var:
+                            register_state[reg_idx] = None
+                elif next_op.type == "reload":
+                    var = next_op.variable
+                    if var in color_assignment:
+                        reg_idx = color_assignment[var]
+                        register_state[reg_idx] = var
+                
+                # Format and print
+                reg_state_str = format_register_state(register_state)
+                
+                if next_op.type == "reload":
+                    # Show color for reload operations
+                    color = color_assignment.get(next_op.variable, None)
+                    if color is not None:
+                        print(f"{reg_state_str}  {next_op.type} {next_op.variable} -> r{color}")
+                    else:
+                        print(f"{reg_state_str}  {next_op.type} {next_op.variable}")
+                else:
+                    # Spill operations don't need color (they're removing from register)
+                    print(f"{reg_state_str}  {next_op.type} {next_op.variable}")
+                
+                try:
+                    next_op = next(op_iter)
+                except StopIteration:
+                    next_op = None
+            
+            # Process phi instruction
+            instr_uses = []
+            instr_defs = [phi.dest]
+            
+            # Process uses: if last use, free the register
+            for use_var in instr_uses:
+                if is_last_use(use_var, block, instr_idx, function):
+                    if use_var in color_assignment:
+                        reg_idx = color_assignment[use_var]
+                        if register_state[reg_idx] == use_var:
+                            register_state[reg_idx] = None
+            
+            # Process defs: variable enters its assigned register
+            for def_var in instr_defs:
+                if def_var in color_assignment:
+                    reg_idx = color_assignment[def_var]
+                    register_state[reg_idx] = def_var
+            
+            # Format register state columns
+            reg_state_str = format_register_state(register_state)
+            
+            # Show color for phi destination
+            dest_color = color_assignment.get(phi.dest, None)
+            dest_str = phi.dest
+            if dest_color is not None:
+                dest_str = f"{phi.dest}->r{dest_color}"
+            
+            incomings_str = ", ".join(f"{inc.block}, {inc.value}" for inc in phi.incomings)
+            print(f"{reg_state_str}  phi {dest_str} [{incomings_str}]")
+            phi_count += 1
+        
+        # Process remaining instructions
+        for instr_idx, instr in enumerate(block.instructions[phi_count:], start=phi_count):
             # Print all operations that should appear before this instruction (position == instr_idx)
             while next_op is not None and next_op.position == instr_idx:
                 # Update register state based on operation
@@ -766,9 +914,6 @@ def print_function_with_register_state(function: Function, spills_reloads: Dict[
             if isinstance(instr, Op):
                 instr_uses = instr.uses
                 instr_defs = instr.defs
-            elif isinstance(instr, Phi):
-                instr_uses = []
-                instr_defs = [instr.dest]
             else:
                 instr_uses = []
                 instr_defs = []
@@ -818,15 +963,6 @@ def print_function_with_register_state(function: Function, spills_reloads: Dict[
             elif isinstance(instr, Jump):
                 targets_str = ",".join(instr.targets)
                 print(f"{reg_state_str}  jmp {targets_str}")
-            elif isinstance(instr, Phi):
-                # Show color for phi destination
-                dest_color = color_assignment.get(instr.dest, None)
-                dest_str = instr.dest
-                if dest_color is not None:
-                    dest_str = f"{instr.dest}->r{dest_color}"
-                
-                incomings_str = ", ".join(f"{inc.block}, {inc.value}" for inc in instr.incomings)
-                print(f"{reg_state_str}  phi {dest_str} [{incomings_str}]")
         
         # Handle operations after the last instruction (position >= len(block.instructions))
         while next_op is not None:
@@ -864,6 +1000,72 @@ def print_function_with_register_state(function: Function, spills_reloads: Dict[
         print()
 
 
+def check_liveness_correctness(function: Function) -> bool:
+    """
+    Check correctness of liveness analysis by verifying that every variable in LiveOut(B)
+    appears in LiveIn(S) for at least one successor S of B.
+
+    Args:
+        function: The Function object to check
+
+    Returns:
+        bool: True if liveness is correct, False otherwise
+
+    Raises:
+        AssertionError: If liveness correctness check fails with details
+    """
+    errors = []
+
+    for block_name, block in function.blocks.items():
+        # Skip terminal blocks (blocks with no successors) as they don't need to propagate liveness
+        if not block.successors:
+            continue
+
+        for val_idx in block.live_out:
+            found_in_successor = False
+            successor_live_ins = []
+            var_name = get_val_name(function, val_idx)
+
+            for successor in block.successors:
+                if successor in function.blocks:
+                    succ_block = function.blocks[successor]
+                    # Convert val_idx to names for error message
+                    succ_live_in_names = sorted([get_val_name(function, idx) for idx in succ_block.live_in])
+                    successor_live_ins.append(
+                        f"{successor}: {succ_live_in_names}"
+                    )
+                    if val_idx in succ_block.live_in:
+                        found_in_successor = True
+                        break
+                    # Also check if var flows into a phi in this successor from this block
+                    for phi in succ_block.phis():
+                        for incoming in phi.incomings:
+                            if incoming.block == block_name and incoming.value == var_name:
+                                found_in_successor = True
+                                break
+                        if found_in_successor:
+                            break
+                    if found_in_successor:
+                        break
+
+            if not found_in_successor:
+                # Convert val_idx to names for error message
+                live_out_names = sorted([get_val_name(function, idx) for idx in block.live_out])
+                error_msg = (
+                    f"Variable '{var_name}' in LiveOut of block '{block_name}' "
+                    f"not found in LiveIn of any successor.\n"
+                    f"  LiveOut({block_name}): {live_out_names}\n"
+                    f"  Successors LiveIn: {successor_live_ins}"
+                )
+                errors.append(error_msg)
+
+    if errors:
+        error_details = "\n\n".join(errors)
+        raise AssertionError(f"Liveness correctness check failed:\n\n{error_details}")
+
+    return True
+
+
 def test_parser(ir_file: str, k: int = 3) -> None:
     """Test the parser with IR from the specified file."""
     try:
@@ -891,7 +1093,7 @@ def test_parser(ir_file: str, k: int = 3) -> None:
         # Check liveness correctness
         print("Checking liveness correctness...")
         try:
-            liveness.check_liveness_correctness(function)
+            check_liveness_correctness(function)
             print("Liveness correctness check passed!")
         except AssertionError as e:
             print(f"Liveness correctness check failed: {e}")

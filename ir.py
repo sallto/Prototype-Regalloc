@@ -85,6 +85,14 @@ class Block:
         self.phi_defs = set()
         self.next_use_distances_by_val = {}
 
+    def phis(self):
+        """Iterate over phi instructions at the start of the block."""
+        for instr in self.instructions:
+            if isinstance(instr, Phi):
+                yield instr
+            else:
+                break  # Phis are always at the beginning
+
 
 @dataclass
 class Function:
@@ -127,9 +135,9 @@ def val_as_phi(function: Function, val_idx: int) -> Union[Phi, None]:
         if val_idx in block.phi_defs:
             # Find the phi instruction that defines this value
             val_name = get_val_name(function, val_idx)
-            for instr in block.instructions:
-                if isinstance(instr, Phi) and instr.dest == val_name:
-                    return instr
+            for phi in block.phis():
+                if phi.dest == val_name:
+                    return phi
     return None
 
 
