@@ -69,7 +69,7 @@ def compute_predecessors_and_use_def_sets(function: Function) -> None:
 
 def build_loop_forest(
     function: Function,
-) -> Tuple[Dict[str, LoopNode], Set[Tuple[str, str]], Dict[str, Set[str]]]:
+) -> Tuple[Dict[str, LoopNode], Set[Tuple[str, str]], Dict[str, Set[str]], Set[Tuple[str, str]]]:
     """
     Build loop-nesting forest for reducible graphs and identify loop edges.
 
@@ -77,10 +77,11 @@ def build_loop_forest(
         function: The Function object with blocks
 
     Returns:
-        Tuple of (loop_forest_dict, loop_edges_set, loop_membership_dict)
+        Tuple of (loop_forest_dict, loop_edges_set, loop_membership_dict, exit_edges_set)
         - loop_forest_dict: Maps block names to their LoopNode in the forest
         - loop_edges_set: Set of (source, target) tuples that are loop edges
         - loop_membership_dict: Maps loop headers to sets of blocks in each loop
+        - exit_edges_set: Set of (source, target) tuples that are loop exit edges
     """
     # This is a simplified implementation for reducible graphs
     # A full implementation would use Tarjan's algorithm or similar
@@ -157,7 +158,30 @@ def build_loop_forest(
                 loop_forest[loop_header].children.append(loop_forest[block])
                 loop_forest[block].parent = loop_forest[loop_header]
 
-    return loop_forest, back_edges, loop_membership
+    # Compute loop exit edges
+    # An exit edge is an edge (src, dst) where src is in a loop but dst is not in the same loop
+    exit_edges = set()
+
+    # Create reverse mapping: block -> set of loops it belongs to
+    block_to_loops = {}
+    for loop_header, loop_blocks in loop_membership.items():
+        for block in loop_blocks:
+            if block not in block_to_loops:
+                block_to_loops[block] = set()
+            block_to_loops[block].add(loop_header)
+
+    # Check each edge in the CFG
+    for src_block_name, src_block in function.blocks.items():
+        for dst_block_name in src_block.successors:
+            # Check if src is in any loop
+            src_loops = block_to_loops.get(src_block_name, set())
+            dst_loops = block_to_loops.get(dst_block_name, set())
+
+            # If src is in a loop but dst is not in any of the same loops, it's an exit edge
+            if src_loops and not dst_loops.intersection(src_loops):
+                exit_edges.add((src_block_name, dst_block_name))
+
+    return loop_forest, back_edges, loop_membership, exit_edges
 
 
 def expand_loop_blocks(
@@ -207,45 +231,6 @@ def get_loop_processing_order(loop_forest: Dict[str, LoopNode]) -> List[str]:
             dfs(node)
 
     return order
-
-
-def compute_loop_exit_edges(
-    loop_membership: Dict[str, Set[str]], function: Function
-) -> Set[Tuple[str, str]]:
-    """
-    Identify loop exit edges.
-
-    An exit edge is an edge (src, dst) where src is in a loop but dst is not in the same loop.
-
-    Args:
-        loop_membership: Dictionary mapping loop headers to sets of blocks in each loop
-        function: The Function object
-
-    Returns:
-        Set of (source, target) tuples representing exit edges
-    """
-    exit_edges = set()
-
-    # Create reverse mapping: block -> set of loops it belongs to
-    block_to_loops = {}
-    for loop_header, loop_blocks in loop_membership.items():
-        for block in loop_blocks:
-            if block not in block_to_loops:
-                block_to_loops[block] = set()
-            block_to_loops[block].add(loop_header)
-
-    # Check each edge in the CFG
-    for src_block_name, src_block in function.blocks.items():
-        for dst_block_name in src_block.successors:
-            # Check if src is in any loop
-            src_loops = block_to_loops.get(src_block_name, set())
-            dst_loops = block_to_loops.get(dst_block_name, set())
-
-            # If src is in a loop but dst is not in any of the same loops, it's an exit edge
-            if src_loops and not dst_loops.intersection(src_loops):
-                exit_edges.add((src_block_name, dst_block_name))
-
-    return exit_edges
 
 
 def postorder_traversal_reduced_cfg(
@@ -299,6 +284,8 @@ def compute_initial_liveness(
     loop_forest: Dict[str, LoopNode],
     loop_edges: Set[Tuple[str, str]],
     loop_membership: Dict[str, Set[str]],
+    exit_edges: Set[Tuple[str, str]],
+    postorder: List[str],
 ) -> None:
     """
     Phase 1: Compute initial liveness sets using postorder traversal of FL(G).
@@ -308,14 +295,9 @@ def compute_initial_liveness(
         loop_forest: Loop forest structure
         loop_edges: Set of loop edges to exclude
         loop_membership: Mapping of loop headers to their member blocks
+        exit_edges: Set of loop exit edges for distance penalties
+        postorder: Postorder traversal of the reduced CFG FL(G)
     """
-    # Compute exit edges for distance penalties
-    exit_edges = compute_loop_exit_edges(loop_membership, function)
-
-    # Perform postorder traversal of reduced CFG (FL(G))
-    postorder = postorder_traversal_reduced_cfg(function, loop_edges)
-
-    # Initialize live sets (already done in Block.__init__)
 
     # Process blocks in postorder using the helper function
     for block_name in postorder:
@@ -493,7 +475,9 @@ def propagate_loop_liveness_and_distances(
     function: Function,
     loop_forest: Dict[str, LoopNode],
     loop_edges: Set[Tuple[str, str]],
-    loop_membership: Dict[str, Set[str]]
+    loop_membership: Dict[str, Set[str]],
+    exit_edges: Set[Tuple[str, str]],
+    postorder: List[str],
 ) -> None:
     """
     Combined phase: Propagate liveness within loop bodies and compute next-use distances.
@@ -503,13 +487,12 @@ def propagate_loop_liveness_and_distances(
         loop_forest: Loop forest structure
         loop_edges: Set of loop edges
         loop_membership: Mapping of loop headers to their member blocks
+        exit_edges: Set of loop exit edges for distance penalties
+        postorder: Postorder traversal of the reduced CFG FL(G)
     """
 
     # Track which blocks need distance recomputation
     affected_blocks = set()
-
-    # Compute exit edges once for both liveness and distance propagation
-    exit_edges = compute_loop_exit_edges(loop_membership, function)
 
     def loop_tree_dfs(node: LoopNode) -> None:
         """Recursive DFS traversal of the loop forest (Algorithm 3)."""
@@ -638,11 +621,10 @@ def propagate_loop_liveness_and_distances(
                         header_block.live_in[val_idx] = d
             
             # Mark all loop blocks for recomputation
-            affected_blocks.update(blocks)
+            #affected_blocks.update(blocks)
 
     # Recompute distances for all affected blocks in postorder
     if affected_blocks:
-        postorder = postorder_traversal_reduced_cfg(function, loop_edges)
         for block_name in postorder:
             if block_name in affected_blocks:
                 recompute_block_live_sets(function, block_name, exit_edges)
@@ -767,12 +749,15 @@ def compute_liveness(function: Function) -> None:
     compute_predecessors_and_use_def_sets(function)
 
     # Build loop forest and identify loop edges
-    loop_forest, loop_edges, loop_membership = build_loop_forest(function)
+    loop_forest, loop_edges, loop_membership, exit_edges = build_loop_forest(function)
+
+    # Compute postorder traversal once for reuse
+    postorder = postorder_traversal_reduced_cfg(function, loop_edges)
 
     # Phase 1: Initial liveness computation
-    compute_initial_liveness(function, loop_forest, loop_edges, loop_membership)
+    compute_initial_liveness(function, loop_forest, loop_edges, loop_membership, exit_edges, postorder)
 
     # Phase 2: Loop propagation and distance computation
-    propagate_loop_liveness_and_distances(function, loop_forest, loop_edges, loop_membership)
+    propagate_loop_liveness_and_distances(function, loop_forest, loop_edges, loop_membership, exit_edges, postorder)
 
 
