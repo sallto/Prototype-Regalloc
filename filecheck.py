@@ -71,6 +71,19 @@ class RegisterState:
     S: Set[str] = field(default_factory=set)  # Variables in spill slots
 
 
+def _var_in_collection(collection, var: str, val_idx: Optional[int]) -> bool:
+    """
+    Helper to check membership in sets/dicts that might be keyed by val_idx.
+    """
+    if collection is None:
+        return False
+    if var in collection:
+        return True
+    if val_idx is None:
+        return False
+    return val_idx in collection
+
+
 @dataclass
 class EvictionEvent:
     """Tracks a deferred eviction event where we're uncertain which variable was evicted."""
@@ -626,6 +639,10 @@ def is_variable_live(block_name: str, var: str, instr_idx: int, function, spill_
         return True
     
     block = function.blocks[block_name]
+
+    val_idx: Optional[int] = None
+    if function is not None and getattr(function, "value_indices", None) is not None:
+        val_idx = function.value_indices.get(var)
     
     # Map instruction index from spill IR to original IR
     # Count only non-spill/reload instructions up to instr_idx
@@ -649,12 +666,8 @@ def is_variable_live(block_name: str, var: str, instr_idx: int, function, spill_
     
     # Check if variable is live-out (needed for successor blocks)
     # This is important even if next-use distance is infinite (variable might be needed later)
-    if isinstance(block.live_out, dict):
-        if var in block.live_out:
-            return True
-    elif isinstance(block.live_out, set):
-        if var in block.live_out:
-            return True
+    if _var_in_collection(block.live_out, var, val_idx):
+        return True
     
     # Variable has no finite next use and is not live-out - it's dead
     return False
@@ -685,9 +698,16 @@ def remove_dead_variables_from_r(state: RegisterState, block_name: str, instr_id
     # Create a copy of R to iterate over (since we'll be modifying it)
     vars_to_check = list(state.R)
     for var in vars_to_check:
+        val_idx: Optional[int] = None
+        if function is not None and getattr(function, "value_indices", None) is not None:
+            val_idx = function.value_indices.get(var)
+
         # Check if variable is used anywhere in the current block
         # (not just in use_set, which only includes uses before defs)
-        used_in_block = var in block.use_set or var in block.phi_uses
+        used_in_block = (
+            _var_in_collection(block.use_set, var, val_idx)
+            or _var_in_collection(block.phi_uses, var, val_idx)
+        )
         if not used_in_block:
             # Check all instructions to see if variable is used anywhere
             for instr in block.instructions:
@@ -705,7 +725,10 @@ def remove_dead_variables_from_r(state: RegisterState, block_name: str, instr_id
         
         # Also check if variable is defined in this block - if so, it can't be evicted
         # if it's used after definition (even if not in use_set)
-        defined_in_block = var in block.def_set or var in block.phi_defs
+        defined_in_block = (
+            _var_in_collection(block.def_set, var, val_idx)
+            or _var_in_collection(block.phi_defs, var, val_idx)
+        )
         if defined_in_block:
             # Variable is defined in this block - check if it's used after definition
             found_def = False
@@ -810,31 +833,19 @@ def remove_dead_variables_from_r(state: RegisterState, block_name: str, instr_id
                     break
             
             # Also check if variable is live-out
-            if isinstance(block.live_out, dict):
-                if var in block.live_out:
-                    is_live = True
-            elif isinstance(block.live_out, set):
-                if var in block.live_out:
-                    is_live = True
+            if _var_in_collection(block.live_out, var, val_idx):
+                is_live = True
         else:
             # Variable not defined in this block - use normal liveness check
             # At block entry (instr_idx == 0), check live_in and live_out
             if instr_idx == 0:
                 # Check live_in
-                if isinstance(block.live_in, dict):
-                    if var in block.live_in:
-                        is_live = True
-                elif isinstance(block.live_in, set):
-                    if var in block.live_in:
-                        is_live = True
+                if _var_in_collection(block.live_in, var, val_idx):
+                    is_live = True
                 
                 # Check live_out
-                if isinstance(block.live_out, dict):
-                    if var in block.live_out:
-                        is_live = True
-                elif isinstance(block.live_out, set):
-                    if var in block.live_out:
-                        is_live = True
+                if _var_in_collection(block.live_out, var, val_idx):
+                    is_live = True
             else:
                 # For other instruction indices, use the full liveness check
                 is_live = is_variable_live(block_name, var, instr_idx, function, spill_function)

@@ -212,15 +212,21 @@ def print_function(function: Function, idom: dict = None, dom_tree: dict = None)
             children = dom_tree.get(block_name, [])
             if children:
                 print(f"    Dominator Tree Children: {sorted(children)}")
-        print(f"    USE set: {sorted(block.use_set) if block.use_set else 'empty'}")
-        print(f"    DEF set: {sorted(block.def_set) if block.def_set else 'empty'}")
-        print(f"    PhiUses: {sorted(block.phi_uses) if block.phi_uses else 'empty'}")
-        print(f"    PhiDefs: {sorted(block.phi_defs) if block.phi_defs else 'empty'}")
+        # Convert val_idx to names for display
+        from ir import get_val_name
+        use_set_names = sorted([get_val_name(function, idx) for idx in block.use_set]) if block.use_set else []
+        def_set_names = sorted([get_val_name(function, idx) for idx in block.def_set]) if block.def_set else []
+        phi_uses_names = sorted([get_val_name(function, idx) for idx in block.phi_uses]) if block.phi_uses else []
+        phi_defs_names = sorted([get_val_name(function, idx) for idx in block.phi_defs]) if block.phi_defs else []
+        print(f"    USE set: {use_set_names if use_set_names else 'empty'}")
+        print(f"    DEF set: {def_set_names if def_set_names else 'empty'}")
+        print(f"    PhiUses: {phi_uses_names if phi_uses_names else 'empty'}")
+        print(f"    PhiDefs: {phi_defs_names if phi_defs_names else 'empty'}")
         print(f"    Max Register Pressure: {block.max_register_pressure}")
-        live_in_str = ', '.join(f"{var}:{dist:.0f}" if dist != float('inf') else f"{var}:inf"
-                               for var, dist in sorted(block.live_in.items())) if isinstance(block.live_in, dict) and block.live_in else 'empty'
-        live_out_str = ', '.join(f"{var}:{dist:.0f}" if dist != float('inf') else f"{var}:inf"
-                                for var, dist in sorted(block.live_out.items())) if isinstance(block.live_out, dict) and block.live_out else 'empty'
+        live_in_str = ', '.join(f"{get_val_name(function, val_idx)}:{dist:.0f}" if dist != float('inf') else f"{get_val_name(function, val_idx)}:inf"
+                               for val_idx, dist in sorted(block.live_in.items())) if isinstance(block.live_in, dict) and block.live_in else 'empty'
+        live_out_str = ', '.join(f"{get_val_name(function, val_idx)}:{dist:.0f}" if dist != float('inf') else f"{get_val_name(function, val_idx)}:inf"
+                                for val_idx, dist in sorted(block.live_out.items())) if isinstance(block.live_out, dict) and block.live_out else 'empty'
         print(f"    LiveIn: {{{live_in_str}}}")
         print(f"    LiveOut: {{{live_out_str}}}")
         print("    Instructions:")
@@ -525,26 +531,30 @@ def compute_register_state(function: Function, spills_reloads: Dict[str, List[Sp
             # Non-entry block: initialize from live-in variables that have colors
             # This is a simplification - coupling code will handle actual transitions
             register_state = [None] * k
+            from ir import get_val_name
+            live_in_val_indices = set()
             if isinstance(block.live_in, dict):
-                live_in_vars = set(block.live_in.keys())
+                live_in_val_indices = set(block.live_in.keys())
             elif isinstance(block.live_in, set):
-                live_in_vars = block.live_in
-            else:
-                live_in_vars = set()
+                live_in_val_indices = block.live_in
             
             # Check for variables that should be in registers at block entry
             # (those that are live-in, have colors, and weren't spilled)
-            for var in live_in_vars:
-                if var in color_assignment:
-                    reg_idx = color_assignment[var]
-                    # Check if this variable was spilled before entering this block
-                    # (spills at position 0 of this block indicate it was spilled)
-                    was_spilled = any(
-                        op.type == "spill" and op.variable == var and op.position == 0
-                        for op in spills_reloads.get(block_name, [])
-                    )
-                    if not was_spilled:
-                        register_state[reg_idx] = var
+            for val_idx in live_in_val_indices:
+                try:
+                    var = get_val_name(function, val_idx)
+                    if var in color_assignment:
+                        reg_idx = color_assignment[var]
+                        # Check if this variable was spilled before entering this block
+                        # (spills at position 0 of this block indicate it was spilled)
+                        was_spilled = any(
+                            op.type == "spill" and op.variable == var and op.position == 0
+                            for op in spills_reloads.get(block_name, [])
+                        )
+                        if not was_spilled:
+                            register_state[reg_idx] = var
+                except ValueError:
+                    pass  # Skip if val_idx not found
         
         # Store initial state for block (before first instruction)
         register_states[(block_name, -1)] = register_state.copy()
@@ -679,23 +689,27 @@ def print_function_with_register_state(function: Function, spills_reloads: Dict[
         register_state = [None] * k
         
         # Initialize from live-in variables that have colors (simplified)
+        from ir import get_val_name
+        live_in_val_indices = set()
         if isinstance(block.live_in, dict):
-            live_in_vars = set(block.live_in.keys())
+            live_in_val_indices = set(block.live_in.keys())
         elif isinstance(block.live_in, set):
-            live_in_vars = block.live_in
-        else:
-            live_in_vars = set()
+            live_in_val_indices = block.live_in
         
-        for var in live_in_vars:
-            if var in color_assignment:
-                reg_idx = color_assignment[var]
-                # Check if this variable was spilled before entering this block
-                was_spilled = any(
-                    op.type == "spill" and op.variable == var and op.position == 0
-                    for op in spills_reloads.get(block_name, [])
-                )
-                if not was_spilled:
-                    register_state[reg_idx] = var
+        for val_idx in live_in_val_indices:
+            try:
+                var = get_val_name(function, val_idx)
+                if var in color_assignment:
+                    reg_idx = color_assignment[var]
+                    # Check if this variable was spilled before entering this block
+                    was_spilled = any(
+                        op.type == "spill" and op.variable == var and op.position == 0
+                        for op in spills_reloads.get(block_name, [])
+                    )
+                    if not was_spilled:
+                        register_state[reg_idx] = var
+            except ValueError:
+                pass  # Skip if val_idx not found
         
         # Print block header
         reg_state_str = format_register_state(register_state)

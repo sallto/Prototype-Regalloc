@@ -165,12 +165,12 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function:
 
     Args:
         block: The block to initialize
-        pred_W_exits: Map from predecessor block names to their W_exit sets
+        pred_W_exits: Map from predecessor block names to their W_exit sets (variable names)
         k: Number of available registers
         function: The function containing the block
 
     Returns:
-        Set of variables that should be in registers at block entry
+        Set of variable names that should be in registers at block entry
     """
     if not block.predecessors:
         return set()
@@ -180,19 +180,20 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[str]], k: int, function:
     take = set()
 
     # Count frequency of each variable across predecessors' W_exit
-    # Only consider variables that are actually live-in to this block
-    live_in_vars = set()
+    # Only consider variables that are actually live-in to this block (by val_idx)
+    live_in_val_indices = set()
     if isinstance(block.live_in, dict):
-        live_in_vars = set(block.live_in.keys())
-    elif isinstance(block.live_in, set):
-        live_in_vars = block.live_in
+        live_in_val_indices = set(block.live_in.keys())
 
     for pred_name in block.predecessors:
         if pred_name in pred_W_exits:
             for var in pred_W_exits[pred_name]:
-                if var in live_in_vars:
-                    freq[var] += 1
-                    cand.add(var)
+                # Convert var name to val_idx for comparison
+                if var in function.value_indices:
+                    val_idx = function.value_indices[var]
+                    if val_idx in live_in_val_indices:
+                        freq[var] += 1
+                        cand.add(var)
         # Variables not in pred_W_exits are ignored (unprocessed predecessors)
 
     # For phi nodes, ensure incoming values are considered for W_entry
@@ -274,12 +275,12 @@ def usedInLoop(loop_header: str, alive_vars: Set[str], loop_membership: Dict[str
 
     Args:
         loop_header: Name of the loop header
-        alive_vars: Set of variables to check
+        alive_vars: Set of variable names to check
         loop_membership: Dictionary mapping loop headers to sets of blocks in each loop
         function: The function containing the blocks
 
     Returns:
-        Set of variables from alive_vars that are used in the loop
+        Set of variable names from alive_vars that are used in the loop
     """
     if loop_header not in loop_membership:
         return set()
@@ -294,8 +295,10 @@ def usedInLoop(loop_header: str, alive_vars: Set[str], loop_membership: Dict[str
 
         # Check if any alive variables are used in this block
         for var in alive_vars:
-            if var in block.use_set or var in block.phi_uses:
-                used_vars.add(var)
+            if var in function.value_indices:
+                val_idx = function.value_indices[var]
+                if val_idx in block.use_set or val_idx in block.phi_uses:
+                    used_vars.add(var)
 
     return used_vars
 
@@ -326,23 +329,25 @@ def getLoopMaxPressure(loop_header: str, loop_membership: Dict[str, Set[str]],
     return max_pressure
 
 
-def sortByNextUse(vars: Set[str], entry_instr_idx: int, block: Block) -> List[str]:
+def sortByNextUse(vars: Set[str], entry_instr_idx: int, block: Block, function: Function) -> List[str]:
     """
     Sort variables by next-use distance from the entry instruction.
 
     Args:
-        vars: Set of variables to sort
+        vars: Set of variable names to sort
         entry_instr_idx: Index of the entry instruction (usually 0)
         block: Block containing the variables
+        function: Function containing value_indices mapping
 
     Returns:
-        List of variables sorted by next-use distance (closest first)
+        List of variable names sorted by next-use distance (closest first)
     """
     def get_next_use_dist(var: str) -> float:
-        if hasattr(block, 'live_in') and isinstance(block.live_in, dict) and var in block.live_in:
-            return block.live_in[var]
-        else:
-            return float('inf')
+        if var in function.value_indices:
+            val_idx = function.value_indices[var]
+            if hasattr(block, 'live_in') and isinstance(block.live_in, dict) and val_idx in block.live_in:
+                return block.live_in[val_idx]
+        return float('inf')
 
     return sorted(vars, key=get_next_use_dist)
 
@@ -383,18 +388,29 @@ def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
 
     Returns:
         Tuple containing:
-        - Set of variables that should be in registers at block entry
-        - Set of variables that should be spilled before entering the loop
+        - Set of variable names that should be in registers at block entry
+        - Set of variable names that should be spilled before entering the loop
     """
+    from ir import get_val_name
     entry = 0  # Index of the first instruction
     loop = loopOf(block.name, loop_membership)
 
     # If block is not in a loop, return empty set
     if loop is None:
-        return set()
+        return set(), set()
 
-    # alive = block.phis ∪ block.liveIn
-    alive = block.phi_defs | set(block.live_in.keys()) if hasattr(block, 'live_in') and isinstance(block.live_in, dict) else block.phi_defs
+    # alive = block.phis ∪ block.liveIn (convert val_idx to names)
+    alive_val_indices = block.phi_defs.copy()
+    if hasattr(block, 'live_in') and isinstance(block.live_in, dict):
+        alive_val_indices.update(block.live_in.keys())
+    
+    # Convert val_idx to variable names
+    alive = set()
+    for val_idx in alive_val_indices:
+        try:
+            alive.add(get_val_name(function, val_idx))
+        except ValueError:
+            pass  # Skip if val_idx not found
 
     # cand = usedInLoop(loop, alive)
     cand = usedInLoop(loop, alive, loop_membership, function)
@@ -413,14 +429,14 @@ def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
             freeLoop = 0
 
         # sort(liveThrough, entry)
-        sorted_liveThrough = sortByNextUse(liveThrough, entry, block)
+        sorted_liveThrough = sortByNextUse(liveThrough, entry, block, function)
 
         # add = liveThrough[0:freeLoop]
         add = set(sorted_liveThrough[:freeLoop])
         liveThrough = liveThrough - add
     else:
         # sort(cand, entry)
-        sorted_cand = sortByNextUse(cand, entry, block)
+        sorted_cand = sortByNextUse(cand, entry, block, function)
 
         # cand = cand[0:k]
         cand = set(sorted_cand[:k])
@@ -523,7 +539,10 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
             # But skip variables that are available from all predecessors (they don't need reloads)
             # Also skip phi incoming values that are already available from this specific predecessor
             # And skip phi incoming values that come from other predecessors (not needed from this edge)
-            reload_vars = ((W_entry - pred_W_exit) - block.phi_defs) - vars_available_from_all - phi_incoming_vars_from_pred - phi_incoming_vars_from_other_preds - block.def_set
+            # Convert block.phi_defs and block.def_set (val_idx) to variable names for comparison
+            block_phi_def_names = {var for var in function.value_indices if function.value_indices[var] in block.phi_defs}
+            block_def_names = {var for var in function.value_indices if function.value_indices[var] in block.def_set}
+            reload_vars = ((W_entry - pred_W_exit) - block_phi_def_names) - vars_available_from_all - phi_incoming_vars_from_pred - phi_incoming_vars_from_other_preds - block_def_names
             
             # Check if reloading would exceed k registers
             # After reloads, we'll have: pred_W_exit ∪ reload_vars
@@ -667,14 +686,16 @@ def is_last_use(var: str, block: Block, instr_idx: int, function: Function) -> b
     Returns:
         True if this is the last use of the variable
     """
-    # Check if variable is live-out
-    if isinstance(block.live_out, dict):
-        if var in block.live_out:
-            # Variable is live-out, so it's not the last use
-            return False
-    elif isinstance(block.live_out, set):
-        if var in block.live_out:
-            return False
+    # Check if variable is live-out (convert name to val_idx)
+    if var in function.value_indices:
+        val_idx = function.value_indices[var]
+        if isinstance(block.live_out, dict):
+            if val_idx in block.live_out:
+                # Variable is live-out, so it's not the last use
+                return False
+        elif isinstance(block.live_out, set):
+            if val_idx in block.live_out:
+                return False
     
     # Variable is not live-out, check if there are more uses in this block
     # Scan forward from the next instruction
@@ -714,16 +735,24 @@ def color_recursive(block_name: str, k: int, color_assignment: Dict[str, int],
         function: Function containing the blocks
         spills_reloads: Dictionary mapping blocks to spill/reload operations
     """
+    from ir import get_val_name
     block = function.blocks[block_name]
     
     # Reset assigned to only include colors of live-in variables
     # All variables live-in have already been colored (by dominating blocks)
+    # Convert val_idx to variable names
+    live_in_val_indices = set()
     if isinstance(block.live_in, dict):
-        live_in_vars = set(block.live_in.keys())
+        live_in_val_indices = set(block.live_in.keys())
     elif isinstance(block.live_in, set):
-        live_in_vars = block.live_in
-    else:
-        live_in_vars = set()
+        live_in_val_indices = block.live_in
+    
+    live_in_vars = set()
+    for val_idx in live_in_val_indices:
+        try:
+            live_in_vars.add(get_val_name(function, val_idx))
+        except ValueError:
+            pass  # Skip if val_idx not found
     
     # Reset assigned set to only include colors of live-in variables
     # But exclude variables that were spilled (they're not in registers)
@@ -859,12 +888,16 @@ def color_recursive(block_name: str, k: int, color_assignment: Dict[str, int],
                 if not available:
                     for var, color_val in sorted(color_assignment.items(), key=lambda x: x[1]):
                         if color_val in assigned:
-                            # Check if this variable is dead
+                            # Check if this variable is dead (convert name to val_idx)
                             is_dead = False
-                            if isinstance(block.live_out, dict):
-                                is_dead = var not in block.live_out
-                            elif isinstance(block.live_out, set):
-                                is_dead = var not in block.live_out
+                            if var in function.value_indices:
+                                val_idx = function.value_indices[var]
+                                if isinstance(block.live_out, dict):
+                                    is_dead = val_idx not in block.live_out
+                                elif isinstance(block.live_out, set):
+                                    is_dead = val_idx not in block.live_out
+                                else:
+                                    is_dead = True
                             else:
                                 is_dead = True
                             
