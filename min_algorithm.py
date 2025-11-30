@@ -215,6 +215,10 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[int]], k: int, function:
                 freq[val_idx] = available_from
                 cand.add(val_idx)
 
+    for val_idx in cand.copy():
+        if val_idx in freq and freq[val_idx] == len(block.predecessors):
+            take.add(val_idx)
+            cand.remove(val_idx)
 
     # If we have more variables in take than available registers,
     # select the k best ones from take based on next-use distance
@@ -545,17 +549,20 @@ def insert_coupling_code_for_edge(pred_name: str, block_name: str, W_entry: Set[
         num_to_spill = len(W_after_reload) - k
         
         # Sort ALL variables in pred_W_exit by next-use distance (furthest first)
-        # Spill based on next-use distance only, not preferring silently evictable variables
-        sorted_pred_vars = sorted(pred_W_exit, key=lambda v: (get_next_use_distance(block, v, 0, function), v), reverse=True)
+        # Prefer evicting variables already in pred_S_exit (silently evictable) over spilling new ones
+        sorted_pred_vars = sorted(pred_W_exit, key=lambda v: (
+            1 if v in pred_S_exit else 0,  # Prefer already spilled (evict first)
+            get_next_use_distance(block, v, 0, function),
+            v
+        ), reverse=True)
         
         # Evict variables with furthest next use
         vars_to_spill_for_reloads = set(sorted_pred_vars[:num_to_spill])
         
         # Insert spills before reloads
-        # Note: For variables already in pred_S_exit, spilling is a no-op for S but removes from R
-        # We still insert spill instructions for state tracking
+        # Skip variables already in pred_S_exit - they can be silently evicted without a spill instruction
         for val_idx in vars_to_spill_for_reloads:
-            if get_next_use_distance(block, val_idx, 0, function) != math.inf:
+            if val_idx not in pred_S_exit and get_next_use_distance(block, val_idx, 0, function) != math.inf:
                 insert_spill_reload_sorted(result[pred_name], SpillReload("spill", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
     
     # Insert reload operations
