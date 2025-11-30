@@ -565,17 +565,22 @@ def recompute_block_live_sets(
     for var in block.use_set:
         block.live_in[var] = float("inf")
 
-    # Initialize per-value use position collection (will be converted to next_use_distances_by_val after propagation)
-    if not hasattr(block, '_value_uses_temp'):
-        block._value_uses_temp = {}
-    value_uses: Dict[str, List[int]] = block._value_uses_temp
+    # Initialize per-value use position collection
+    value_uses: Dict[str, List[int]] = {}
 
     # Process instructions in reverse to compute actual use distances
     block_len = len(block.instructions)
+
+    # Initialize liveness tracking for pressure calculation
+    live_set = set(block.live_out.keys()) if isinstance(block.live_out, dict) else set()
+    max_pressure = len(live_set)  # pressure at block exit
+
     i = block_len
     for instr in reversed(block.instructions):
         i -= 1
         if isinstance(instr, Op):
+            defs_set = set(instr.defs)
+            uses_set = set(instr.uses)
             for use in instr.uses:
                 # Update live_in distance if variable is in live_in
                 if use in block.live_in:
@@ -584,7 +589,17 @@ def recompute_block_live_sets(
                 if use not in value_uses:
                     value_uses[use] = []
                 value_uses[use].append(i)
+
+            # Update register pressure: variables live at this point include live_set plus defs and uses
+            # live_set currently contains variables that are live after this instruction
+            current_live = live_set | defs_set | uses_set
+            max_pressure = max(max_pressure, len(current_live))
+
+            # Update live_set for next iteration: remove defs, add uses (backward liveness)
+            live_set = (live_set - defs_set) | uses_set
         elif isinstance(instr, Phi):
+            defs_set = {instr.dest}
+            uses_set = {incoming.value for incoming in instr.incomings}
             for incoming in instr.incomings:
                 use = incoming.value
                 # Update live_in distance if variable is in live_in
@@ -595,10 +610,52 @@ def recompute_block_live_sets(
                     value_uses[use] = []
                 value_uses[use].append(i)
 
+            # Update register pressure: variables live at this point include live_set plus defs and uses
+            # live_set currently contains variables that are live after this instruction
+            current_live = live_set | defs_set | uses_set
+            max_pressure = max(max_pressure, len(current_live))
+
+            # Update live_set for next iteration: remove defs, add uses (backward liveness)
+            live_set = (live_set - defs_set) | uses_set
+
+    # Final pressure check: pressure at block entry (before any instructions)
+    max_pressure = max(max_pressure, len(live_set))
+
     # Adjust live_in distances for pass-through variables
     for var, dist in block.live_in.items():
         if dist >= block_len and var in block.live_out:
             block.live_in[var] = block.live_out[var] + block_len
+
+    # Convert collected use positions to next_use_distances_by_val
+    block.next_use_distances_by_val = {}
+
+    # Convert variable names to val_idx and store in block.next_use_distances_by_val
+    for var, use_positions in value_uses.items():
+        if var in function.value_indices:
+            val_idx = function.value_indices[var]
+            # Sort to get chronological order (since we collected in reverse)
+            sorted_positions = sorted(use_positions)
+            # Add liveout distance as the last entry (using final live_out values after propagation)
+            if isinstance(block.live_out, dict) and var in block.live_out:
+                # live_out[var] is distance from block exit, so add block_len to get distance from start
+                sorted_positions.append(block_len + block.live_out[var])
+            else:
+                # Not live out, append infinity as the last entry
+                sorted_positions.append(math.inf)
+            block.next_use_distances_by_val[val_idx] = sorted_positions
+
+    # Handle variables that are in live_out but didn't appear in value_uses
+    if isinstance(block.live_out, dict):
+        for var in block.live_out:
+            if var in function.value_indices:
+                val_idx = function.value_indices[var]
+                # Only add if not already processed above
+                if val_idx not in block.next_use_distances_by_val:
+                    # Variable is live out but has no uses in this block
+                    # Add liveout distance as the only entry
+                    block.next_use_distances_by_val[val_idx] = [block_len + block.live_out[var]]
+
+    block.max_register_pressure = max_pressure
 
 
 def propagate_loop_liveness_and_distances(
@@ -758,63 +815,6 @@ def check_liveness_correctness(function: Function) -> bool:
     return True
 
 
-def compute_next_use_distances(
-    function: Function,
-) -> Dict[Tuple[str, int], List[float]]:
-    """
-    Compute next-use distances for all variable definitions in linear IR.
-
-    For each variable definition, calculates the instruction distances to all subsequent uses.
-    Distance is infinity if there are no further uses.
-
-    Args:
-        function: The Function object with instructions
-
-    Returns:
-        Dict mapping (variable_name, definition_instruction_index) -> list of distances
-    """
-    distances = {}
-
-    # For linear IR without control flow, process blocks in order
-    # Assume blocks are processed in the order they appear (b0, b1, etc.)
-    block_names = sorted(function.blocks.keys())
-
-    # Collect all instructions in global order
-    all_instructions = []
-    for block_name in block_names:
-        block = function.blocks[block_name]
-        for instr in block.instructions:
-            all_instructions.append((instr, block_name))
-
-    # For each instruction that defines variables
-    for def_idx, (instr, def_block) in enumerate(all_instructions):
-        if isinstance(instr, Op) and instr.defs:
-            for var in instr.defs:
-                # Get value index from function's value_indices map
-                if var not in function.value_indices:
-                    continue
-                def_val_idx = function.value_indices[var]
-                key = (var, def_val_idx)
-                distances[key] = []
-
-                # Scan forward for uses of this variable
-                for use_idx in range(def_idx + 1, len(all_instructions)):
-                    use_instr, use_block = all_instructions[use_idx]
-
-                    if isinstance(use_instr, Op) and var in use_instr.uses:
-                        # Found a use - calculate distance using value indices
-                        # Since we're tracking value indices, distance is based on value index difference
-                        # For now, use instruction index difference as approximation
-                        # (could be refined to use value indices if needed)
-                        distance = use_idx - def_idx
-                        distances[key].append(distance)
-
-                # If no uses found, add infinity
-                if not distances[key]:
-                    distances[key].append(float("inf"))
-
-    return distances
-
 
 def get_next_use_distance(block: Block, var: str, current_idx: int, function: Function) -> float:
     """
@@ -850,85 +850,6 @@ def get_next_use_distance(block: Block, var: str, current_idx: int, function: Fu
     return math.inf
 
 
-def compute_register_pressure(block: Block, function: Function) -> int:
-    """
-    Compute the maximum register pressure for a block by tracking live variables
-    at each instruction point.
-
-    A variable needs a register if:
-    1. It has a finite next-use distance at that instruction point
-    2. OR it's in live_out (needs to be preserved for successor blocks)
-
-    Args:
-        block: The block to analyze
-        function: The function containing value_indices mapping
-
-    Returns:
-        Maximum number of live variables at any point in the block
-    """
-    if not block.instructions:
-        return 0
-
-    max_pressure = 0
-
-    # All variables that are live out need registers throughout the block
-    live_out_vars = set()
-    if isinstance(block.live_out, dict):
-        live_out_vars = set(block.live_out.keys())
-
-    # Track variables that are currently live (have registers allocated)
-    live_vars = set()
-
-    # Start with variables from live_in that are live at block entry
-    # (those with finite next-use distance)
-    if isinstance(block.live_in, dict):
-        for var, dist in block.live_in.items():
-            if dist != float('inf'):
-                live_vars.add(var)
-
-    # Add all live_out variables (they need registers throughout)
-    live_vars.update(live_out_vars)
-
-    max_pressure = max(max_pressure, len(live_vars))
-
-    # Process each instruction
-    for i, instr in enumerate(block.instructions):
-        # Count pressure at the start of this instruction
-        max_pressure = max(max_pressure, len(live_vars))
-
-        # Process the instruction
-        if isinstance(instr, Op):
-            # Variables used here may become dead if they have no more finite uses
-            for var in instr.uses:
-                next_use_dist = get_next_use_distance(block, var, i, function)
-                if next_use_dist == float('inf') and var not in live_out_vars:
-                    live_vars.discard(var)
-
-            # Variables defined here kill their previous live status (unless live out)
-            for var in instr.defs:
-                if var not in live_out_vars:
-                    live_vars.discard(var)
-
-            # Newly defined variables are live if they have finite next uses or are live out
-            for var in instr.defs:
-                next_use_dist = get_next_use_distance(block, var, i, function)
-                if next_use_dist != float('inf') or var in live_out_vars:
-                    live_vars.add(var)
-
-        elif isinstance(instr, Phi):
-            # Phi destinations are defined here
-            if instr.dest not in live_out_vars:
-                live_vars.discard(instr.dest)
-
-            # Phi destinations are live if they have finite next uses or are live out
-            next_use_dist = get_next_use_distance(block, instr.dest, i, function)
-            if next_use_dist != float('inf') or instr.dest in live_out_vars:
-                live_vars.add(instr.dest)
-
-        # Count pressure at the end of this instruction
-        max_pressure = max(max_pressure, len(live_vars))
-
-    return max_pressure
 
 
 def compute_liveness(function: Function) -> None:
@@ -947,46 +868,7 @@ def compute_liveness(function: Function) -> None:
     # Phase 1: Initial liveness computation
     compute_initial_liveness(function, loop_forest, loop_edges, loop_membership)
 
-    # Phase 2: Loop propagation and next-use distances
+    # Phase 2: Loop propagation and distance computation
     propagate_loop_liveness_and_distances(function, loop_forest, loop_edges, loop_membership)
 
-    # Convert collected use positions to next_use_distances_by_val using final live_out values
-    for block in function.blocks.values():
-        block.next_use_distances_by_val = {}
-        if not hasattr(block, '_value_uses_temp'):
-            continue
-        value_uses = block._value_uses_temp
-        block_len = len(block.instructions)
-        
-        # Convert variable names to val_idx and store in block.next_use_distances_by_val
-        for var, use_positions in value_uses.items():
-            if var in function.value_indices:
-                val_idx = function.value_indices[var]
-                # Sort to get chronological order (since we collected in reverse)
-                sorted_positions = sorted(use_positions)
-                # Add liveout distance as the last entry (using final live_out values after propagation)
-                if isinstance(block.live_out, dict) and var in block.live_out:
-                    # live_out[var] is distance from block exit, so add block_len to get distance from start
-                    sorted_positions.append(block_len + block.live_out[var])
-                else:
-                    # Not live out, append infinity as the last entry
-                    sorted_positions.append(math.inf)
-                block.next_use_distances_by_val[val_idx] = sorted_positions
-        
-        # Handle variables that are in live_out but didn't appear in value_uses
-        if isinstance(block.live_out, dict):
-            for var in block.live_out:
-                if var in function.value_indices:
-                    val_idx = function.value_indices[var]
-                    # Only add if not already processed above
-                    if val_idx not in block.next_use_distances_by_val:
-                        # Variable is live out but has no uses in this block
-                        # Add liveout distance as the only entry
-                        block.next_use_distances_by_val[val_idx] = [block_len + block.live_out[var]]
-        
-        # Clean up temporary storage
-        delattr(block, '_value_uses_temp')
 
-    # Phase 5: Compute register pressure for all blocks
-    for block in function.blocks.values():
-        block.max_register_pressure = compute_register_pressure(block, function)
