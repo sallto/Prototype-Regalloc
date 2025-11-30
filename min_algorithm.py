@@ -457,6 +457,9 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
     W_exit_map = {}  # block_name -> set of value indices in registers at exit
     S_exit_map = {}  # block_name -> set of value indices spilled at exit
 
+    # Track blocks that need second-pass processing (back edges where predecessor was processed after successor)
+    blocks_needing_second_pass = set()
+
     # Process each block in topological order
     for block_name in block_order:
         block = function.blocks[block_name]
@@ -497,6 +500,7 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
         for pred_name in block.predecessors:
             # Only insert coupling code if the predecessor has been processed
             if pred_name not in W_exit_map:
+                blocks_needing_second_pass.add(pred_name)
                 continue
 
             pred_W_exit = W_exit_map[pred_name]
@@ -602,15 +606,12 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
         S_exit_map[block_name] = S.copy()
 
     # Second pass: handle coupling code for back edges (loop edges) where predecessor was processed after successor
-    for block_name in block_order:
+    for block_name in blocks_needing_second_pass:
         block = function.blocks[block_name]
         block_W_exit = W_exit_map[block_name]
 
         # For each successor that has phi nodes using values from this block
         for succ_name in block.successors:
-            if succ_name not in function.blocks:
-                continue
-
             succ_block = function.blocks[succ_name]
 
             # Check if this successor has phi nodes that need incoming values from this block
