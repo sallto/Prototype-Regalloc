@@ -566,7 +566,7 @@ def recompute_block_live_sets(
         block.live_in[var] = float("inf")
 
     # Initialize per-value use position collection
-    value_uses: Dict[str, List[int]] = {}
+    value_uses: Dict[int, List[int]] = {}
 
     # Process instructions in reverse to compute actual use distances
     block_len = len(block.instructions)
@@ -586,9 +586,11 @@ def recompute_block_live_sets(
                 if use in block.live_in:
                     block.live_in[use] = min(block.live_in[use], i)
                 # Collect use positions for per-value analysis (all uses, not just live_in)
-                if use not in value_uses:
-                    value_uses[use] = []
-                value_uses[use].append(i)
+                if use in function.value_indices:
+                    val_idx = function.value_indices[use]
+                    if val_idx not in value_uses:
+                        value_uses[val_idx] = []
+                    value_uses[val_idx].append(i)
 
             # Update register pressure: variables live at this point include live_set plus defs and uses
             # live_set currently contains variables that are live after this instruction
@@ -606,9 +608,11 @@ def recompute_block_live_sets(
                 if use in block.live_in:
                     block.live_in[use] = min(block.live_in[use], i)
                 # Collect phi incoming values as uses (all uses, not just live_in)
-                if use not in value_uses:
-                    value_uses[use] = []
-                value_uses[use].append(i)
+                if use in function.value_indices:
+                    val_idx = function.value_indices[use]
+                    if val_idx not in value_uses:
+                        value_uses[val_idx] = []
+                    value_uses[val_idx].append(i)
 
             # Update register pressure: variables live at this point include live_set plus defs and uses
             # live_set currently contains variables that are live after this instruction
@@ -629,20 +633,22 @@ def recompute_block_live_sets(
     # Convert collected use positions to next_use_distances_by_val
     block.next_use_distances_by_val = {}
 
-    # Convert variable names to val_idx and store in block.next_use_distances_by_val
-    for var, use_positions in value_uses.items():
-        if var in function.value_indices:
-            val_idx = function.value_indices[var]
-            # Sort to get chronological order (since we collected in reverse)
-            sorted_positions = sorted(use_positions)
-            # Add liveout distance as the last entry (using final live_out values after propagation)
-            if isinstance(block.live_out, dict) and var in block.live_out:
-                # live_out[var] is distance from block exit, so add block_len to get distance from start
-                sorted_positions.append(block_len + block.live_out[var])
-            else:
-                # Not live out, append infinity as the last entry
-                sorted_positions.append(math.inf)
-            block.next_use_distances_by_val[val_idx] = sorted_positions
+    # Create reverse lookup from val_idx to variable name for checking block.live_out
+    val_idx_to_var = {idx: var for var, idx in function.value_indices.items()}
+
+    # Process value_uses (now keyed by val_idx) and store in block.next_use_distances_by_val
+    for val_idx, use_positions in value_uses.items():
+        # Sort to get chronological order (since we collected in reverse)
+        sorted_positions = sorted(use_positions)
+        # Add liveout distance as the last entry (using final live_out values after propagation)
+        var = val_idx_to_var[val_idx]  # Get variable name for live_out check
+        if isinstance(block.live_out, dict) and var in block.live_out:
+            # live_out[var] is distance from block exit, so add block_len to get distance from start
+            sorted_positions.append(block_len + block.live_out[var])
+        else:
+            # Not live out, append infinity as the last entry
+            sorted_positions.append(math.inf)
+        block.next_use_distances_by_val[val_idx] = sorted_positions
 
     # Handle variables that are in live_out but didn't appear in value_uses
     if isinstance(block.live_out, dict):
