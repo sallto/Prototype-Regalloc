@@ -1067,11 +1067,9 @@ def check_liveness_correctness(function: Function) -> bool:
                         break
                     # Also check if var flows into a phi in this successor from this block
                     for phi in succ_block.phis():
-                        for incoming in phi.incomings:
-                            if incoming.block == block_name and incoming.value == var_name:
-                                found_in_successor = True
-                                break
-                        if found_in_successor:
+                        incoming_val = phi.incoming_val_for_block(block_name)
+                        if incoming_val == var_name:
+                            found_in_successor = True
                             break
                     if found_in_successor:
                         break

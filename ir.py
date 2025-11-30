@@ -57,6 +57,19 @@ class Phi(Instruction):
         self.dest = dest
         self.incomings = incomings
 
+    def incoming_val_for_block(self, block_name: str) -> Union[str, None]:
+        """Return the incoming value from a given predecessor block, or None if not found."""
+        for incoming in self.incomings:
+            if incoming.block == block_name:
+                return incoming.value
+        return None
+
+    def incoming_block_for_slot(self, slot_idx: int) -> Union[str, None]:
+        """Return the predecessor block name at a given slot index, or None if out of bounds."""
+        if 0 <= slot_idx < len(self.incomings):
+            return self.incomings[slot_idx].block
+        return None
+
 @dataclass
 class Block:
     name: str

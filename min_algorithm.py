@@ -196,10 +196,11 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[int]], k: int, function:
     # Add phi incoming values that are available from their predecessors
     phi_val_indices = set()
     for phi in block.phis():
-        for incoming in phi.incomings:
-            if incoming.value in function.value_indices:
-                incoming_val_idx = function.value_indices[incoming.value]
-                if incoming.block in pred_W_exits and incoming_val_idx in pred_W_exits[incoming.block]:
+        for pred_name in block.predecessors:
+            incoming_val = phi.incoming_val_for_block(pred_name)
+            if incoming_val is not None and incoming_val in function.value_indices:
+                incoming_val_idx = function.value_indices[incoming_val]
+                if pred_name in pred_W_exits and incoming_val_idx in pred_W_exits[pred_name]:
                     phi_val_indices.add(incoming_val_idx)
 
     # Add phi vars to candidates with frequency equal to number of predecessors they come from
@@ -512,15 +513,18 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
             # Also collect ALL phi incoming values that come from OTHER predecessors (don't need them from this edge)
             phi_incoming_val_indices_from_other_preds = set()
             for phi in block.phis():
-                for incoming in phi.incomings:
-                    if incoming.value in function.value_indices:
-                        incoming_val_idx = function.value_indices[incoming.value]
-                        # If this incoming value comes from this predecessor and is already in that predecessor's W_exit
-                        if incoming.block == pred_name and incoming_val_idx in pred_W_exit:
-                            phi_incoming_val_indices_from_pred.add(incoming_val_idx)
-                        # If this incoming value comes from a different predecessor, we don't need it from this edge
-                        elif incoming.block != pred_name:
-                            phi_incoming_val_indices_from_other_preds.add(incoming_val_idx)
+                incoming_val = phi.incoming_val_for_block(pred_name)
+                if incoming_val is not None and incoming_val in function.value_indices:
+                    incoming_val_idx = function.value_indices[incoming_val]
+                    # If this incoming value comes from this predecessor and is already in that predecessor's W_exit
+                    if incoming_val_idx in pred_W_exit:
+                        phi_incoming_val_indices_from_pred.add(incoming_val_idx)
+                # Collect incoming values from other predecessors
+                for other_pred in block.predecessors:
+                    if other_pred != pred_name:
+                        other_incoming_val = phi.incoming_val_for_block(other_pred)
+                        if other_incoming_val is not None and other_incoming_val in function.value_indices:
+                            phi_incoming_val_indices_from_other_preds.add(function.value_indices[other_incoming_val])
 
             # Reload: All variables in W_entry \ W_exit_pred (excluding phi destinations)
             # But skip variables that are available from all predecessors (they don't need reloads)
@@ -617,9 +621,9 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
             # Check if this successor has phi nodes that need incoming values from this block
             phi_incoming_val_indices = set()
             for phi in succ_block.phis():
-                for incoming in phi.incomings:
-                    if incoming.block == block_name and incoming.value in function.value_indices:
-                        phi_incoming_val_indices.add(function.value_indices[incoming.value])
+                incoming_val = phi.incoming_val_for_block(block_name)
+                if incoming_val is not None and incoming_val in function.value_indices:
+                    phi_incoming_val_indices.add(function.value_indices[incoming_val])
 
             # Reload phi incoming values that aren't in registers at this block's exit
             phi_reload_val_indices = phi_incoming_val_indices - block_W_exit
