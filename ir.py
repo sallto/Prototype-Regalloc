@@ -77,8 +77,8 @@ class Block:
         self.instructions = []
         self.successors = []
         self.predecessors = []
-        self.live_in = set()
-        self.live_out = set()
+        self.live_in = {}
+        self.live_out = {}
         self.use_set = set()
         self.def_set = set()
         self.phi_uses = set()

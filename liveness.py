@@ -496,16 +496,28 @@ def compute_initial_liveness(
         block = function.blocks[block_name]
 
         # Remove PhiDefs(S) from LiveIn(S) for each successor S before computing LiveOut
-        live = block.phi_uses.copy()
+        live = {var: float("inf") for var in block.phi_uses}
         for successor in block.successors:
-            live |= function.blocks[successor].live_in - function.blocks[successor].phi_defs
+            succ_block = function.blocks[successor]
+            # Merge live_in from successor, excluding phi_defs, taking minimums
+            for var, val in succ_block.live_in.items():
+                if var not in succ_block.phi_defs:
+                    if var not in live:
+                        live[var] = val
+                    else:
+                        live[var] = min(live[var], val)
         block.live_out = live
 
         # LiveIn(B) = (LiveOut(B) - DEF(B)) ∪ USE(B)
-        block.live_in = (block.live_out - block.def_set) | block.use_set
+        # Start with live_out, excluding def_set keys
+        block.live_in = {var: val for var, val in block.live_out.items() if var not in block.def_set}
+        # Add use_set keys
+        for var in block.use_set:
+            block.live_in[var] = float("inf")
 
         # Add PhiDefs(B) to LiveIn(B)
-        block.live_in.update(block.phi_defs)
+        for var in block.phi_defs:
+            block.live_in[var] = float("inf")
 
 
 def propagate_loop_liveness(
@@ -523,18 +535,22 @@ def propagate_loop_liveness(
         """Recursive DFS traversal of the loop forest (Algorithm 3)."""
         if node.is_loop:
             # Collect all live variables in this loop
-            loop_live_vars = set()
+            loop_live_vars = {}
 
             # Add live vars from the loop header
             block_n = function.blocks[node.block_name]
-            loop_live_vars.update(block_n.live_in)
-            loop_live_vars.update(block_n.live_out)
+            for var, val in block_n.live_in.items():
+                loop_live_vars[var] = min(loop_live_vars.get(var, val), val)
+            for var, val in block_n.live_out.items():
+                loop_live_vars[var] = min(loop_live_vars.get(var, val), val)
 
             # Add live vars from all children (recursive)
             def collect_live_vars(n: LoopNode) -> None:
                 block = function.blocks[n.block_name]
-                loop_live_vars.update(block.live_in)
-                loop_live_vars.update(block.live_out)
+                for var, val in block.live_in.items():
+                    loop_live_vars[var] = min(loop_live_vars.get(var, val), val)
+                for var, val in block.live_out.items():
+                    loop_live_vars[var] = min(loop_live_vars.get(var, val), val)
                 for child in n.children:
                     collect_live_vars(child)
 
@@ -542,13 +558,15 @@ def propagate_loop_liveness(
                 collect_live_vars(child)
 
             # Propagate all loop live vars to the header and children
-            block_n.live_in.update(loop_live_vars)
-            block_n.live_out.update(loop_live_vars)
+            for var, val in loop_live_vars.items():
+                block_n.live_in[var] = min(block_n.live_in.get(var, val), val)
+                block_n.live_out[var] = min(block_n.live_out.get(var, val), val)
 
             for child in node.children:
                 block_m = function.blocks[child.block_name]
-                block_m.live_in.update(loop_live_vars)
-                block_m.live_out.update(loop_live_vars)
+                for var, val in loop_live_vars.items():
+                    block_m.live_in[var] = min(block_m.live_in.get(var, val), val)
+                    block_m.live_out[var] = min(block_m.live_out.get(var, val), val)
 
                 # Recursively process child
                 loop_tree_dfs(child)
@@ -1023,15 +1041,6 @@ def compute_liveness(function: Function) -> None:
 
     # Phase 2: Loop propagation
     propagate_loop_liveness(function, loop_forest)
-
-
-    for block_name in function.blocks:
-        function.blocks[block_name].live_in = {
-            var: float("inf") for var in function.blocks[block_name].live_in
-        }
-        function.blocks[block_name].live_out = {
-            var: float("inf") for var in function.blocks[block_name].live_out
-        }
 
     # Phase 3: Compute next-use distances (including per-value distances)
     compute_block_next_use_distances(function)
