@@ -601,14 +601,14 @@ def recompute_block_live_sets(
             block.live_in[var] = block.live_out[var] + block_len
 
 
-def propagate_loop_liveness(
+def propagate_loop_liveness_and_distances(
     function: Function,
     loop_forest: Dict[str, LoopNode],
     loop_edges: Set[Tuple[str, str]],
     loop_membership: Dict[str, Set[str]]
 ) -> None:
     """
-    Phase 2: Propagate liveness within loop bodies using Algorithm 3.
+    Combined phase: Propagate liveness within loop bodies and compute next-use distances.
 
     Args:
         function: The Function object
@@ -619,6 +619,9 @@ def propagate_loop_liveness(
 
     # Track which blocks need distance recomputation
     affected_blocks = set()
+
+    # Compute exit edges once for both liveness and distance propagation
+    exit_edges = compute_loop_exit_edges(loop_membership, function)
 
     def loop_tree_dfs(node: LoopNode) -> None:
         """Recursive DFS traversal of the loop forest (Algorithm 3)."""
@@ -670,133 +673,27 @@ def propagate_loop_liveness(
     for root in roots:
         loop_tree_dfs(root)
 
-    # Recompute distances for affected blocks in postorder
+    # Compute loop-aware next-use distances
+    if loop_membership:
+        loop_infos = gather_loop_analysis(function, loop_forest, loop_edges)
+        if loop_infos:
+            compute_loop_best_entries(loop_infos, loop_forest)
+            apply_loop_best_entries(function, loop_infos)
+
+            # Add blocks affected by distance computation
+            for info in loop_infos.values():
+                affected_blocks.update(info.blocks)
+
+    # Recompute distances for all affected blocks in postorder
     if affected_blocks:
-        exit_edges = compute_loop_exit_edges(loop_membership, function)
         postorder = postorder_traversal_reduced_cfg(function, loop_edges)
         for block_name in postorder:
             if block_name in affected_blocks:
                 recompute_block_live_sets(function, block_name, exit_edges)
 
 
-def propagate_next_use_distances(
-    function: Function,
-    loop_forest: Dict[str, LoopNode],
-    loop_membership: Dict[str, Set[str]],
-    loop_edges: Set[Tuple[str, str]],
-) -> None:
-    """
-    Propagate next-use distances within loop bodies without a fixpoint iteration.
-
-    Args:
-        function: The Function object
-        loop_forest: Loop forest structure
-        loop_membership: Mapping of loop headers to their (original) member blocks
-        loop_edges: Set of back edges in the CFG
-    """
-
-    if not loop_membership:
-        return
-
-    exit_edges = compute_loop_exit_edges(loop_membership, function)
-    loop_infos = gather_loop_analysis(function, loop_forest, loop_edges)
-    if not loop_infos:
-        return
-
-    compute_loop_best_entries(loop_infos, loop_forest)
-    apply_loop_best_entries(function, loop_infos)
-
-    def recompute_block(block_name: str) -> None:
-        block = function.blocks[block_name]
-
-        for succ in block.successors:
-            if succ not in function.blocks:
-                continue
-            succ_block = function.blocks[succ]
-            succ_live_in = succ_block.live_in
-
-        for var, val in succ_live_in.items():
-            adjusted_val = val
-            if (block_name, succ) in exit_edges:
-                adjusted_val += 10**9
-
-            if var in succ_block.phi_defs:
-                phi_instr = val_as_phi(function, var)
-                if not phi_instr:
-                    continue
-                for incoming in phi_instr.incomings:
-                    if incoming.block == block_name:
-                        incoming_val = incoming.value
-                        # Only update distance if the variable is already in live_out
-                        if incoming_val in block.live_out:
-                            prev = block.live_out[incoming_val]
-                            if adjusted_val < prev:
-                                block.live_out[incoming_val] = adjusted_val
-            else:
-                # Only update distance if the variable is already in live_out
-                if var in block.live_out:
-                    prev = block.live_out[var]
-                    if adjusted_val < prev:
-                        block.live_out[var] = adjusted_val
-
-        tracked_vars = set(block.live_in.keys()) | set(block.live_out.keys())
-        block_len = len(block.instructions)
-        i = block_len
-        temp_in = {var: float("inf") for var in tracked_vars}
-
-        # Collect variables defined in this block
-        defined_vars = set()
-        for instr in block.instructions:
-            if isinstance(instr, Op):
-                defined_vars.update(instr.defs)
-            elif isinstance(instr, Phi):
-                defined_vars.add(instr.dest)
-
-        block_loops = set()
-        for loop_header, loop_blocks in loop_membership.items():
-            if block_name in loop_blocks:
-                block_loops.add(loop_header)
-
-        for instr in reversed(block.instructions):
-            i -= 1
-            if isinstance(instr, Op):
-                for use in instr.uses:
-                    # Only update distance if the variable is already in temp_in
-                    if use in temp_in:
-                        temp_in[use] = min(temp_in[use], i)
-            elif isinstance(instr, Phi):
-                for incoming in instr.incomings:
-                    use = incoming.value
-                    incoming_block_loops = set()
-                    for loop_header, loop_blocks in loop_membership.items():
-                        if incoming.block in loop_blocks:
-                            incoming_block_loops.add(loop_header)
-
-                    if not block_loops or block_loops.intersection(incoming_block_loops):
-                        # Only update distance if the variable is already in temp_in
-                        if use in temp_in:
-                            temp_in[use] = min(temp_in[use], i)
-
-        for var in list(temp_in.keys()):
-            # Don't add variables to live_in if they're defined in this block
-            if var in defined_vars:
-                continue
-            dist = temp_in[var]
-            if dist >= block_len and var in block.live_out:
-                dist = min(dist, block.live_out[var] + block_len)
-            prev = block.live_in.get(var, float("inf"))
-            if dist < prev:
-                block.live_in[var] = dist
 
 
-    affected_blocks: Set[str] = set()
-    for info in loop_infos.values():
-        affected_blocks.update(info.blocks)
-
-    postorder = postorder_traversal_reduced_cfg(function, loop_edges)
-    for block_name in postorder:
-        if block_name in affected_blocks:
-            recompute_block(block_name)
 
 
 def check_liveness_correctness(function: Function) -> bool:
@@ -1050,11 +947,8 @@ def compute_liveness(function: Function) -> None:
     # Phase 1: Initial liveness computation
     compute_initial_liveness(function, loop_forest, loop_edges, loop_membership)
 
-    # Phase 2: Loop propagation
-    propagate_loop_liveness(function, loop_forest, loop_edges, loop_membership)
-
-    # Phase 3: Propagate next-use distances within loops
-    propagate_next_use_distances(function, loop_forest, loop_membership, loop_edges)
+    # Phase 2: Loop propagation and next-use distances
+    propagate_loop_liveness_and_distances(function, loop_forest, loop_edges, loop_membership)
 
     # Convert collected use positions to next_use_distances_by_val using final live_out values
     for block in function.blocks.values():
