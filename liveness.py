@@ -69,7 +69,7 @@ def compute_predecessors_and_use_def_sets(function: Function) -> None:
 
 def build_loop_forest(
     function: Function,
-) -> Tuple[Dict[str, LoopNode], Set[Tuple[str, str]], Dict[str, Set[str]], Set[Tuple[str, str]]]:
+) -> Tuple[Dict[str, LoopNode], Set[Tuple[str, str]], Dict[str, Set[str]], Set[Tuple[str, str]], List[str]]:
     """
     Build loop-nesting forest for reducible graphs and identify loop edges.
 
@@ -77,11 +77,12 @@ def build_loop_forest(
         function: The Function object with blocks
 
     Returns:
-        Tuple of (loop_forest_dict, loop_edges_set, loop_membership_dict, exit_edges_set)
+        Tuple of (loop_forest_dict, loop_edges_set, loop_membership_dict, exit_edges_set, postorder)
         - loop_forest_dict: Maps block names to their LoopNode in the forest
         - loop_edges_set: Set of (source, target) tuples that are loop edges
         - loop_membership_dict: Maps loop headers to sets of blocks in each loop
         - exit_edges_set: Set of (source, target) tuples that are loop exit edges
+        - postorder: List of block names in postorder traversal of the reduced CFG FL(G)
     """
     # This is a simplified implementation for reducible graphs
     # A full implementation would use Tarjan's algorithm or similar
@@ -94,6 +95,7 @@ def build_loop_forest(
     loop_headers = set()
     back_edges = set()
     loop_forest = {}
+    postorder = []
 
     def dfs(block_name: str, predecessor: str = None):
         """DFS traversal to find loops and build forest structure."""
@@ -115,6 +117,7 @@ def build_loop_forest(
 
         visiting.remove(block_name)
         visited.add(block_name)
+        postorder.append(block_name)
 
         # Create LoopNode for this block
         loop_forest[block_name] = LoopNode(
@@ -181,7 +184,7 @@ def build_loop_forest(
             if src_loops and not dst_loops.intersection(src_loops):
                 exit_edges.add((src_block_name, dst_block_name))
 
-    return loop_forest, back_edges, loop_membership, exit_edges
+    return loop_forest, back_edges, loop_membership, exit_edges, postorder
 
 
 def expand_loop_blocks(
@@ -231,52 +234,6 @@ def get_loop_processing_order(loop_forest: Dict[str, LoopNode]) -> List[str]:
             dfs(node)
 
     return order
-
-
-def postorder_traversal_reduced_cfg(
-    function: Function, loop_edges: Set[Tuple[str, str]]
-) -> List[str]:
-    """
-    Perform postorder traversal of the reduced CFG FL(G) by building adjacency list on-the-fly
-    while filtering out loop edges.
-
-    Args:
-        function: The Function object
-        loop_edges: Set of (source, target) tuples that are loop edges
-
-    Returns:
-        List of block names in postorder traversal of FL(G)
-    """
-    # Build adjacency list on-the-fly while filtering loop edges
-    adj = {}
-    all_blocks = set(function.blocks.keys())
-
-    for block in all_blocks:
-        adj[block] = []
-
-    for block_name, block in function.blocks.items():
-        for successor in block.successors:
-            edge = (block_name, successor)
-            if edge not in loop_edges:
-                adj[block_name].append(successor)
-
-    # Perform postorder traversal
-    visited = set()
-    postorder = []
-
-    def dfs(block_name: str):
-        visited.add(block_name)
-        for neighbor in adj[block_name]:
-            if neighbor not in visited:
-                dfs(neighbor)
-        postorder.append(block_name)
-
-    # Visit all nodes
-    for block in all_blocks:
-        if block not in visited:
-            dfs(block)
-
-    return postorder
 
 
 def compute_initial_liveness(
@@ -749,10 +706,7 @@ def compute_liveness(function: Function) -> None:
     compute_predecessors_and_use_def_sets(function)
 
     # Build loop forest and identify loop edges
-    loop_forest, loop_edges, loop_membership, exit_edges = build_loop_forest(function)
-
-    # Compute postorder traversal once for reuse
-    postorder = postorder_traversal_reduced_cfg(function, loop_edges)
+    loop_forest, loop_edges, loop_membership, exit_edges, postorder = build_loop_forest(function)
 
     # Phase 1: Initial liveness computation
     compute_initial_liveness(function, loop_forest, loop_edges, loop_membership, exit_edges, postorder)

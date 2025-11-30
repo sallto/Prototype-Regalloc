@@ -469,7 +469,7 @@ def min_algorithm(function: Function, k: int = 3) -> Dict[str, List[SpillReload]
     block_order = topological_order(function)
 
     # Build loop membership information
-    _, _, loop_membership, _ = build_loop_forest(function)
+    _, _, loop_membership, _, _ = build_loop_forest(function)
 
     # Track W_exit and S_exit for each block
     W_exit_map = {}  # block_name -> set of variables in registers at exit
