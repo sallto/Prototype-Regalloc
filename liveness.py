@@ -490,97 +490,122 @@ def compute_initial_liveness(
     """
     # Compute exit edges for distance penalties
     exit_edges = compute_loop_exit_edges(loop_membership, function)
-    
+
     # Perform postorder traversal of reduced CFG (FL(G))
     postorder = postorder_traversal_reduced_cfg(function, loop_edges)
 
     # Initialize live sets (already done in Block.__init__)
 
-    # Process blocks in postorder
+    # Process blocks in postorder using the helper function
     for block_name in postorder:
-        block = function.blocks[block_name]
+        recompute_block_live_sets(function, block_name, exit_edges)
 
-        # Compute live_out as the merged live_in from all successors, taking minimums
-        # Start with phi_uses (values flowing into phis from this block)
-        # Phi uses happen at successor entry, so distance is 0 from block exit
-        live_out = {var: 0 for var in block.phi_uses}
-        
-        for succ in block.successors:
-            if succ in function.blocks:
-                succ_block = function.blocks[succ]
-                succ_live_in = succ_block.live_in
-                for var, val in succ_live_in.items():
-                    adjusted_val = val
-                    if (block_name, succ) in exit_edges:
-                        adjusted_val += 10**9
-                    # Exclude phi destinations from successor's live_in
-                    if var in succ_block.phi_defs:
-                        # For phi destinations, find the incoming value from this block
-                        phi_instr = val_as_phi(function, var)
-                        if phi_instr:
-                            for incoming in phi_instr.incomings:
-                                if incoming.block == block_name:
-                                    # Include the incoming value instead
-                                    incoming_val = incoming.value
-                                    if incoming_val not in live_out:
-                                        live_out[incoming_val] = adjusted_val
-                                    else:
-                                        live_out[incoming_val] = min(live_out[incoming_val], adjusted_val)
-                        # Don't include the phi destination itself
+
+def recompute_block_live_sets(
+    function: Function,
+    block_name: str,
+    exit_edges: Set[Tuple[str, str]],
+    restrict_vars: Set[str] = None
+) -> None:
+    """
+    Recompute live_out and live_in for a block based on current successor live_in values.
+
+    Args:
+        function: The Function object
+        block_name: Name of block to recompute
+        exit_edges: Set of loop exit edges for distance penalties
+        restrict_vars: If provided, only consider variables in this set for live_out computation
+    """
+    block = function.blocks[block_name]
+
+    # Compute live_out as the merged live_in from all successors, taking minimums
+    # Start with phi_uses (values flowing into phis from this block)
+    # Phi uses happen at successor entry, so distance is 0 from block exit
+    live_out = {var: 0 for var in block.phi_uses}
+
+    for succ in block.successors:
+        if succ in function.blocks:
+            succ_block = function.blocks[succ]
+            succ_live_in = succ_block.live_in
+            for var, val in succ_live_in.items():
+                # If restrict_vars is provided, only consider variables in that set
+                if restrict_vars is not None and var not in restrict_vars:
+                    continue
+
+                adjusted_val = val
+                if (block_name, succ) in exit_edges:
+                    adjusted_val += 10**9
+                # Exclude phi destinations from successor's live_in
+                if var in succ_block.phi_defs:
+                    # For phi destinations, find the incoming value from this block
+                    phi_instr = val_as_phi(function, var)
+                    if phi_instr:
+                        for incoming in phi_instr.incomings:
+                            if incoming.block == block_name:
+                                # Include the incoming value instead
+                                incoming_val = incoming.value
+                                if incoming_val not in live_out:
+                                    live_out[incoming_val] = adjusted_val
+                                else:
+                                    live_out[incoming_val] = min(live_out[incoming_val], adjusted_val)
+                    # Don't include the phi destination itself
+                else:
+                    # Include non-phi variables normally
+                    if var not in live_out:
+                        live_out[var] = adjusted_val
                     else:
-                        # Include non-phi variables normally
-                        if var not in live_out:
-                            live_out[var] = adjusted_val
-                        else:
-                            live_out[var] = min(live_out[var], adjusted_val)
+                        live_out[var] = min(live_out[var], adjusted_val)
 
-        block.live_out = live_out
+    block.live_out = live_out
 
-        # LiveIn(B) = (LiveOut(B) - DEF(B)) ∪ USE(B)
-        # Start with live_out, excluding def_set and phi_defs keys
-        block.live_in = {var: val for var, val in block.live_out.items() if var not in block.def_set and var not in block.phi_defs}
-        # Add use_set keys
-        for var in block.use_set:
-            block.live_in[var] = float("inf")
+    # LiveIn(B) = (LiveOut(B) - DEF(B)) ∪ USE(B)
+    # Start with live_out, excluding def_set and phi_defs keys
+    block.live_in = {var: val for var, val in block.live_out.items() if var not in block.def_set and var not in block.phi_defs}
+    # Add use_set keys
+    for var in block.use_set:
+        block.live_in[var] = float("inf")
 
-        # Initialize per-value use position collection (will be converted to next_use_distances_by_val after propagation)
-        if not hasattr(block, '_value_uses_temp'):
-            block._value_uses_temp = {}
-        value_uses: Dict[str, List[int]] = block._value_uses_temp
+    # Initialize per-value use position collection (will be converted to next_use_distances_by_val after propagation)
+    if not hasattr(block, '_value_uses_temp'):
+        block._value_uses_temp = {}
+    value_uses: Dict[str, List[int]] = block._value_uses_temp
 
-        # Process instructions in reverse to compute actual use distances
-        block_len = len(block.instructions)
-        i = block_len
-        for instr in reversed(block.instructions):
-            i -= 1
-            if isinstance(instr, Op):
-                for use in instr.uses:
-                    # Update live_in distance if variable is in live_in
-                    if use in block.live_in:
-                        block.live_in[use] = min(block.live_in[use], i)
-                    # Collect use positions for per-value analysis (all uses, not just live_in)
-                    if use not in value_uses:
-                        value_uses[use] = []
-                    value_uses[use].append(i)
-            elif isinstance(instr, Phi):
-                for incoming in instr.incomings:
-                    use = incoming.value
-                    # Update live_in distance if variable is in live_in
-                    if use in block.live_in:
-                        block.live_in[use] = min(block.live_in[use], i)
-                    # Collect phi incoming values as uses (all uses, not just live_in)
-                    if use not in value_uses:
-                        value_uses[use] = []
-                    value_uses[use].append(i)
+    # Process instructions in reverse to compute actual use distances
+    block_len = len(block.instructions)
+    i = block_len
+    for instr in reversed(block.instructions):
+        i -= 1
+        if isinstance(instr, Op):
+            for use in instr.uses:
+                # Update live_in distance if variable is in live_in
+                if use in block.live_in:
+                    block.live_in[use] = min(block.live_in[use], i)
+                # Collect use positions for per-value analysis (all uses, not just live_in)
+                if use not in value_uses:
+                    value_uses[use] = []
+                value_uses[use].append(i)
+        elif isinstance(instr, Phi):
+            for incoming in instr.incomings:
+                use = incoming.value
+                # Update live_in distance if variable is in live_in
+                if use in block.live_in:
+                    block.live_in[use] = min(block.live_in[use], i)
+                # Collect phi incoming values as uses (all uses, not just live_in)
+                if use not in value_uses:
+                    value_uses[use] = []
+                value_uses[use].append(i)
 
-        # Adjust live_in distances for pass-through variables
-        for var, dist in block.live_in.items():
-            if dist >= block_len and var in block.live_out:
-                block.live_in[var] = block.live_out[var] + block_len
+    # Adjust live_in distances for pass-through variables
+    for var, dist in block.live_in.items():
+        if dist >= block_len and var in block.live_out:
+            block.live_in[var] = block.live_out[var] + block_len
 
 
 def propagate_loop_liveness(
-    function: Function, loop_forest: Dict[str, LoopNode]
+    function: Function,
+    loop_forest: Dict[str, LoopNode],
+    loop_edges: Set[Tuple[str, str]],
+    loop_membership: Dict[str, Set[str]]
 ) -> None:
     """
     Phase 2: Propagate liveness within loop bodies using Algorithm 3.
@@ -588,56 +613,70 @@ def propagate_loop_liveness(
     Args:
         function: The Function object
         loop_forest: Loop forest structure
+        loop_edges: Set of loop edges
+        loop_membership: Mapping of loop headers to their member blocks
     """
+
+    # Track which blocks need distance recomputation
+    affected_blocks = set()
 
     def loop_tree_dfs(node: LoopNode) -> None:
         """Recursive DFS traversal of the loop forest (Algorithm 3)."""
         if node.is_loop:
-            # Collect all live variables in this loop
-            loop_live_vars = {}
+            # Collect all live variable NAMES in this loop (not distances)
+            loop_live_vars = set()
 
             # Add live vars from the loop header
             block_n = function.blocks[node.block_name]
-            for var, val in block_n.live_in.items():
-                loop_live_vars[var] = min(loop_live_vars.get(var, val), val)
-            for var, val in block_n.live_out.items():
-                loop_live_vars[var] = min(loop_live_vars.get(var, val), val)
+            loop_live_vars.update(block_n.live_in.keys())
+            loop_live_vars.update(block_n.live_out.keys())
 
             # Add live vars from all children (recursive)
             def collect_live_vars(n: LoopNode) -> None:
                 block = function.blocks[n.block_name]
-                for var, val in block.live_in.items():
-                    loop_live_vars[var] = min(loop_live_vars.get(var, val), val)
-                for var, val in block.live_out.items():
-                    loop_live_vars[var] = min(loop_live_vars.get(var, val), val)
+                loop_live_vars.update(block.live_in.keys())
+                loop_live_vars.update(block.live_out.keys())
                 for child in n.children:
                     collect_live_vars(child)
 
             for child in node.children:
                 collect_live_vars(child)
 
-            # Propagate all loop live vars to the header and children
-            for var, val in loop_live_vars.items():
+            # Propagate all loop live vars to the header and children (with placeholder distances)
+            for var in loop_live_vars:
                 # Don't add variables to live_in if they're defined in this block
                 if var not in block_n.def_set and var not in block_n.phi_defs:
-                    block_n.live_in[var] = min(block_n.live_in.get(var, val), val)
-                block_n.live_out[var] = min(block_n.live_out.get(var, val), val)
+                    block_n.live_in[var] = block_n.live_in.get(var, float('inf'))
+                block_n.live_out[var] = block_n.live_out.get(var, float('inf'))
 
             for child in node.children:
                 block_m = function.blocks[child.block_name]
-                for var, val in loop_live_vars.items():
+                for var in loop_live_vars:
                     # Don't add variables to live_in if they're defined in this block
                     if var not in block_m.def_set and var not in block_m.phi_defs:
-                        block_m.live_in[var] = min(block_m.live_in.get(var, val), val)
-                    block_m.live_out[var] = min(block_m.live_out.get(var, val), val)
+                        block_m.live_in[var] = block_m.live_in.get(var, float('inf'))
+                    block_m.live_out[var] = block_m.live_out.get(var, float('inf'))
 
+                # Mark child block for recomputation
+                affected_blocks.add(child.block_name)
                 # Recursively process child
                 loop_tree_dfs(child)
+
+            # Mark header block for recomputation
+            affected_blocks.add(node.block_name)
 
     # Start from root nodes (nodes with no parent)
     roots = [node for node in loop_forest.values() if node.parent is None]
     for root in roots:
         loop_tree_dfs(root)
+
+    # Recompute distances for affected blocks in postorder
+    if affected_blocks:
+        exit_edges = compute_loop_exit_edges(loop_membership, function)
+        postorder = postorder_traversal_reduced_cfg(function, loop_edges)
+        for block_name in postorder:
+            if block_name in affected_blocks:
+                recompute_block_live_sets(function, block_name, exit_edges)
 
 
 def propagate_next_use_distances(
@@ -1012,79 +1051,7 @@ def compute_liveness(function: Function) -> None:
     compute_initial_liveness(function, loop_forest, loop_edges, loop_membership)
 
     # Phase 2: Loop propagation
-    propagate_loop_liveness(function, loop_forest)
-
-    # Phase 2.5: Recompute live_out after loop propagation (needed because loop propagation
-    # may have added variables to live_out, and we need to recompute distances from successors)
-    exit_edges = compute_loop_exit_edges(loop_membership, function)
-    postorder = postorder_traversal_reduced_cfg(function, loop_edges)
-    for block_name in postorder:
-        block = function.blocks[block_name]
-        # Compute live_out as the merged live_in from all successors, taking minimums
-        # Start with phi_uses (values flowing into phis from this block)
-        # Phi uses happen at successor entry, so distance is 0 from block exit
-        live_out = {var: 0 for var in block.phi_uses}
-        
-        for succ in block.successors:
-            if succ in function.blocks:
-                succ_block = function.blocks[succ]
-                succ_live_in = succ_block.live_in
-                for var, val in succ_live_in.items():
-                    adjusted_val = val
-                    if (block_name, succ) in exit_edges:
-                        adjusted_val += 10**9
-                    # Exclude phi destinations from successor's live_in
-                    if var in succ_block.phi_defs:
-                        # For phi destinations, find the incoming value from this block
-                        phi_instr = val_as_phi(function, var)
-                        if phi_instr:
-                            for incoming in phi_instr.incomings:
-                                if incoming.block == block_name:
-                                    # Include the incoming value instead
-                                    incoming_val = incoming.value
-                                    if incoming_val not in live_out:
-                                        live_out[incoming_val] = adjusted_val
-                                    else:
-                                        live_out[incoming_val] = min(live_out[incoming_val], adjusted_val)
-                        # Don't include the phi destination itself
-                    elif var in block.live_out:
-                        # Include non-phi variables normally, but only if already in live_out
-                        if var not in live_out:
-                            live_out[var] = adjusted_val
-                        else:
-                            live_out[var] = min(live_out[var], adjusted_val)
-        
-        block.live_out = live_out
-        
-        # Recompute live_in distances after live_out changed
-        # LiveIn(B) = (LiveOut(B) - DEF(B)) ∪ USE(B)
-        # Start with live_out, excluding def_set and phi_defs keys
-        block.live_in = {var: val for var, val in block.live_out.items() if var not in block.def_set and var not in block.phi_defs}
-        # Add use_set keys
-        for var in block.use_set:
-            block.live_in[var] = float("inf")
-        
-        # Process instructions in reverse to recompute distances
-        block_len = len(block.instructions)
-        i = block_len
-        for instr in reversed(block.instructions):
-            i -= 1
-            if isinstance(instr, Op):
-                for use in instr.uses:
-                    # Update live_in distance if variable is in live_in
-                    if use in block.live_in:
-                        block.live_in[use] = min(block.live_in[use], i)
-            elif isinstance(instr, Phi):
-                for incoming in instr.incomings:
-                    use = incoming.value
-                    # Update live_in distance if variable is in live_in
-                    if use in block.live_in:
-                        block.live_in[use] = min(block.live_in[use], i)
-        
-        # Adjust live_in distances for pass-through variables
-        for var, dist in block.live_in.items():
-            if dist >= block_len and var in block.live_out:
-                block.live_in[var] = block.live_out[var] + block_len
+    propagate_loop_liveness(function, loop_forest, loop_edges, loop_membership)
 
     # Phase 3: Propagate next-use distances within loops
     propagate_next_use_distances(function, loop_forest, loop_membership, loop_edges)
