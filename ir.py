@@ -2,8 +2,8 @@
 IR Classes for Simple SSA-like Intermediate Representation
 """
 
-from dataclasses import dataclass
-from typing import List, Dict, Set, Tuple, Union
+from dataclasses import dataclass, field
+from typing import List, Dict, Set, Tuple, Union, Optional
 
 
 @dataclass
@@ -25,11 +25,15 @@ class Instruction:
 class Op(Instruction):
     uses: List[str]
     defs: List[str]
+    use_colors: Dict[str, int] = field(default_factory=dict)
+    def_colors: Dict[str, int] = field(default_factory=dict)
 
     def __init__(self, uses: List[str] = [], defs: List[str] = []):
         super().__init__(kind="op")
         self.uses = uses
         self.defs = defs
+        self.use_colors = {}
+        self.def_colors = {}
 
 
 @dataclass
@@ -51,11 +55,13 @@ class PhiIncoming:
 class Phi(Instruction):
     dest: str
     incomings: List[PhiIncoming]
+    dest_color: Optional[int] = None
 
     def __init__(self, dest: str, incomings: List[PhiIncoming]):
         super().__init__(kind="phi")
         self.dest = dest
         self.incomings = incomings
+        self.dest_color = None
 
     def incoming_val_for_block(self, block_name: str) -> Union[str, None]:
         """Return the incoming value from a given predecessor block, or None if not found."""

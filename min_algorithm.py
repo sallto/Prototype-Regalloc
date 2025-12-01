@@ -12,7 +12,7 @@ pressure exceeds the available number of registers k.
 from collections import defaultdict
 import math
 import bisect
-from typing import Dict, List, Set, Union, Tuple
+from typing import Dict, List, Set, Union, Tuple, Optional
 from dataclasses import dataclass
 from ir import Function, Block, Op, Jump, Phi
 from liveness import get_next_use_distance
@@ -65,6 +65,7 @@ class SpillReload:
     block_name: str
     is_coupling: bool = False  # True if this is coupling code between blocks
     edge_info: str = ""  # For coupling operations: "pred->block"
+    color: Optional[int] = None  # Register color: for spills, the register being spilled from; for reloads, the register being loaded into
 
     def __str__(self) -> str:
         location = f"{self.block_name}:{self.position}"
@@ -768,7 +769,8 @@ def is_last_use(val_idx: int, block: Block, instr_idx: int, function: Function) 
     # Scan forward from the next instruction
     # Use next_use_distance utility to check for further uses in the block.
     # next_use_distance returns None if there is no further use, otherwise returns the distance.
-    if get_next_use_distance(block, val_idx, instr_idx, function) is not None:
+    next_use_distance = get_next_use_distance(block, val_idx, instr_idx, function)
+    if next_use_distance is not None and next_use_distance != math.inf:
         return False
     
     # No more uses found, this is the last use
