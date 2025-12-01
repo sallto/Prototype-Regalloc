@@ -20,7 +20,8 @@ import liveness
 import min_algorithm
 import dominators
 from liveness import get_next_use_distance
-from min_algorithm import SpillReload, color_program
+from min_algorithm import SpillReload
+from coloring import color_program
 import argparse
 import sys
 
