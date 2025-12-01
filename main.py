@@ -1021,7 +1021,7 @@ def test_parser(ir_file: str, k: int = 3) -> None:
 
         # Run SSA-based coloring
         print(f"Running SSA-based coloring with k={k}...")
-        color_program(function, k=k, spills_reloads=spills_reloads)
+        color_program(function, k=k, spills_reloads=spills_reloads, loop_membership=loop_membership)
         print("Coloring completed!")
         print()
 

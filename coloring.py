@@ -20,6 +20,64 @@ def is_live_out_of_op(
     return not is_last_use(val_idx, block, op_idx, function)
 
 
+def get_phi_hint_color(
+    phi: Phi,
+    block: Block,
+    function: Function,
+    block_var_to_color: Dict[str, Dict[int, int]],
+    loop_membership: Dict[str, Set[str]],
+) -> Optional[int]:
+    """
+    Get a hint color for a phi function based on incoming values with highest execution frequency.
+    
+    Returns the color from the incoming value whose predecessor block has the highest loop depth.
+    This implements register hints as a form of copy propagation during the scan process.
+    
+    Args:
+        phi: The phi instruction
+        block: The block containing the phi
+        function: The function containing the block
+        block_var_to_color: Dictionary mapping block names to their var_to_color state
+        loop_membership: Dictionary mapping loop headers to sets of blocks in each loop
+        
+    Returns:
+        A hint color if available, or None
+    """
+    best_color = None
+    best_depth = -1
+    
+    for incoming in phi.incomings:
+        # Get the value index for the incoming value
+        if incoming.value not in function.value_indices:
+            continue
+            
+        val_idx = function.value_indices[incoming.value]
+        
+        # Look up the color from the predecessor block's state
+        pred_var_to_color = block_var_to_color.get(incoming.block)
+        if pred_var_to_color is None:
+            continue
+            
+        if val_idx not in pred_var_to_color:
+            continue
+            
+        incoming_color = pred_var_to_color[val_idx]
+        
+        # Get loop depth of the predecessor block
+        pred_block = function.blocks.get(incoming.block)
+        if pred_block is None:
+            continue
+            
+        pred_depth = pred_block.loop_depth
+        
+        # Select the color from the incoming with highest loop depth
+        if pred_depth > best_depth:
+            best_depth = pred_depth
+            best_color = incoming_color
+    
+    return best_color
+
+
 def choose_color(
     allocated: Set[int], k: int, last_color: Optional[int] = None
 ) -> Optional[int]:
@@ -341,13 +399,19 @@ def fix_global_color(
 
 
 def color_program(
-    function: Function, k: int, spills_reloads: Dict[str, List[SpillReload]]
+    function: Function, k: int, spills_reloads: Dict[str, List[SpillReload]], loop_membership: Dict[str, Set[str]]
 ) -> None:
     """
     Tree-scan coloring algorithm (Algorithm 2).
 
     Assigns register colors to SSA values using dominance-based inheritance.
     Colors are stored directly on Op and Phi instructions.
+    
+    Args:
+        function: The Function object to color
+        k: Number of available registers
+        spills_reloads: Dictionary mapping block names to lists of spill/reload operations
+        loop_membership: Dictionary mapping loop headers to sets of blocks in each loop
     """
     # Compute dominator tree
     idom = dominators.compute_dominators(function)
@@ -396,14 +460,13 @@ def color_program(
 
         # Forward traversal of the operations
         phi_count = 0
-        for phi in block.phis():
-            phi_count += 1
 
         # Process phi operations first (they're at the beginning)
         # Note: spills/reloads cannot occur before or between phis
         # Phi arguments are considered on incoming edges, but we still need to assign colors to phi destinations
         for phi_idx, phi in enumerate(block.phis()):
             
+            phi_count += 1
             # Get set of currently allocated register colors
             allocated_colors = {
                 var_to_color[v] for v in allocated_variables if v in var_to_color
@@ -412,8 +475,17 @@ def color_program(
             # Process phi destination
             if phi.dest in function.value_indices:
                 d_val_idx = function.value_indices[phi.dest]
-                # Choose color for phi destination
-                color = choose_color(allocated_colors, k, last_color)
+                # Try to get a hint color from incoming values with highest execution frequency
+                hint_color = get_phi_hint_color(
+                    phi, block, function, block_var_to_color, loop_membership
+                )
+                print(hint_color)
+                # Use hint color if available and not already allocated
+                if hint_color is not None and hint_color not in allocated_colors:
+                    color = hint_color
+                else:
+                    # Fall back to round-robin selection
+                    color = choose_color(allocated_colors, k, last_color)
                 if color is None:
                     success = repair_result(
                         block, phi, phi_idx, d_val_idx, [], function, k
@@ -442,8 +514,8 @@ def color_program(
                         allocated_variables.discard(d_val_idx)
                         if d_val_idx in var_to_color:
                             allocated_colors.discard(var_to_color[d_val_idx])
+            assert(phi.dest_color is not None)
 
-        print(phi_count)
         # Process remaining operations (non-phi)
         for op_idx, instr in enumerate(block.instructions[phi_count:], start=phi_count):
             # Process spills/reloads at this instruction position
@@ -469,9 +541,13 @@ def color_program(
                     k,
                     last_color,
                 )
+                assert(len(instr.use_colors) == len(instr.uses))
+                assert(len(instr.def_colors) == len(instr.defs))
+                assert(len(set(instr.use_colors.values()))==len(instr.uses)) 
             elif isinstance(instr, Phi):
                 # Shouldn't happen after phi_count, but handle it anyway by skipping
                 pass
+    
 
             # Check if this is the last point where we can insert code
             # (op.next is None or op.next.isLateOperation)

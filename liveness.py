@@ -184,6 +184,10 @@ def build_loop_forest(
                 block_to_loops[block] = set()
             block_to_loops[block].add(loop_header)
 
+    # Compute loop depth for each block (number of loops it belongs to)
+    for block_name, block in function.blocks.items():
+        block.loop_depth = len(block_to_loops.get(block_name, set()))
+
     # Check each edge in the CFG
     for src_block_name, src_block in function.blocks.items():
         for dst_block_name in src_block.successors:

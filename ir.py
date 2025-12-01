@@ -90,6 +90,7 @@ class Block:
     phi_defs: Set[int]
     max_register_pressure: int = 0
     next_use_distances_by_val: Dict[int, List[float]] = None
+    loop_depth: int = 0
 
     def __init__(self, name: str):
         self.name = name
@@ -103,6 +104,7 @@ class Block:
         self.phi_uses = set()
         self.phi_defs = set()
         self.next_use_distances_by_val = {}
+        self.loop_depth = 0
 
     def phis(self):
         """Iterate over phi instructions at the start of the block."""
