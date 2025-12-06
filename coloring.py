@@ -586,7 +586,6 @@ def color_program(
     function: Function,
     k: int,
     spills_reloads: Dict[str, List[SpillReload]],
-    loop_membership: Dict[str, Set[str]],
 ) -> None:
     """
     Tree-scan coloring algorithm (Algorithm 2).

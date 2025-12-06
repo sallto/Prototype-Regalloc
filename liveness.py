@@ -2,7 +2,7 @@
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from ir import Block, Function, Op, Phi, val_as_phi
 
@@ -15,6 +15,22 @@ class LoopNode:
     is_loop: bool  # True if this represents a loop header
     children: List["LoopNode"]
     parent: "LoopNode" = None
+
+
+@dataclass
+class LoopInfo:
+    """List-based loop descriptor (analogue of the C++ small-vector layout)."""
+
+    header: str
+    level: int
+    parent: Optional[int]
+    begin: int  # inclusive block index in block_layout
+    end: int  # exclusive block index in block_layout
+    num_blocks: int
+    definitions: int = 0
+    definitions_in_childs: int = 0
+    irreducible: bool = False
+    reentries: List[Tuple[str, str]] = None
 
 
 def compute_predecessors_and_use_def_sets(function: Function) -> None:
@@ -75,24 +91,26 @@ def compute_predecessors_and_use_def_sets(function: Function) -> None:
 def build_loop_forest(
     function: Function,
 ) -> Tuple[
-    Dict[str, LoopNode],
-    Set[Tuple[str, str]],
-    Dict[str, Set[str]],
-    Set[Tuple[str, str]],
-    List[str],
-    List[str],
-    Dict[str, int],
+    List[str],  # block_layout (RPO)
+    List[Optional[int]],  # block_loop_map: loop index per block index
+    List[LoopInfo],  # loops
+    Set[Tuple[str, str]],  # loop/back edges
+    Set[Tuple[str, str]],  # exit edges
+    List[str],  # postorder
+    List[str],  # rpo
+    Dict[str, int],  # name_to_rpo_idx
 ]:
     """
-    Build loop-nesting forest using the one-pass DFS tagging algorithm of
-    Wei et al. (“A New Algorithm for Identifying Loops in Decompilation”).
+    Build loop descriptors using the one-pass DFS tagging algorithm of
+    Wei et al. (“A New Algorithm for Identifying Loops in Decompilation”)
+    and emit list-based structures analogous to the C++ layout.
 
-    Returns:
-        Tuple of (loop_forest_dict, loop_edges_set, loop_membership_dict, exit_edges_set, postorder, rpo, name_to_rpo_idx)
-        - loop_forest_dict: Maps block names to their LoopNode in the forest
-        - loop_edges_set: Set of (source, target) tuples that are loop/back edges
-        - loop_membership_dict: Maps loop headers to sets of blocks in each loop
-        - exit_edges_set: Set of (source, target) tuples that are loop exit edges
+    Returns (block_layout, block_loop_map, loops, loop_edges, exit_edges, postorder, rpo, name_to_rpo_idx)
+        - block_layout: List of block names in reverse postorder (RPO) traversal
+        - block_loop_map: List aligned with block_layout; entry is the loop index (or None) that owns the block (innermost)
+        - loops: List of LoopInfo with header, level, parent index, begin/end range over block_layout, and metadata
+        - loop_edges: Set of (source, target) tuples that are loop/back edges
+        - exit_edges: Set of (source, target) tuples that are loop exit edges
         - postorder: List of block names in postorder traversal
         - rpo: List of block names in reverse postorder (RPO) traversal
         - name_to_rpo_idx: Dictionary mapping block names to their RPO indices
@@ -101,14 +119,14 @@ def build_loop_forest(
     # Per-block transient metadata
     traversed: Set[str] = set()
     dfsp_pos: Dict[str, int] = {name: 0 for name in function.blocks}
-    iloop_header: Dict[str, str] = {name: None for name in function.blocks}
+    iloop_header: Dict[str, Optional[str]] = {name: None for name in function.blocks}
     is_loop_header: Set[str] = set()
     irreducible_headers: Set[str] = set()
     reentry_edges: Set[Tuple[str, str]] = set()
     loop_edges: Set[Tuple[str, str]] = set()
     postorder: List[str] = []
 
-    def tag_lhead(b: str, h: str) -> None:
+    def tag_lhead(b: str, h: Optional[str]) -> None:
         """Weave header h into the loop-header list of b according to DFSP positions."""
         if h is None or b == h:
             return
@@ -125,7 +143,7 @@ def build_loop_forest(
                 cur1 = ih
         iloop_header[cur1] = cur2
 
-    def trav_loops_dfs(b0: str, pos: int) -> str:
+    def trav_loops_dfs(b0: str, pos: int) -> Optional[str]:
         """Single-pass DFS that tags loop headers on demand."""
         traversed.add(b0)
         dfsp_pos[b0] = pos
@@ -187,19 +205,7 @@ def build_loop_forest(
     # RPO and index mapping
     rpo = list(reversed(postorder))
     name_to_rpo_idx = {block_name: idx for idx, block_name in enumerate(rpo)}
-
-    # Create LoopNode instances
-    loop_forest: Dict[str, LoopNode] = {}
-    for block_name in rpo:
-        block_idx = name_to_rpo_idx[block_name]
-        loop_forest[block_name] = LoopNode(
-            block_idx=block_idx,
-            is_loop=block_name in is_loop_header,
-            children=[],
-        )
-        # Optional irreducible marker on headers
-        if block_name in irreducible_headers:
-            setattr(loop_forest[block_name], "irreducible", True)
+    block_layout = rpo
 
     # Compute loop membership from tagged headers (include nested headers)
     loop_membership: Dict[str, Set[str]] = {}
@@ -213,70 +219,146 @@ def build_loop_forest(
     for header in is_loop_header:
         loop_membership.setdefault(header, set()).add(header)
 
-    # Build parent-child relationships based on immediate innermost header
-    for block_name in function.blocks:
-        header = iloop_header[block_name]
-        if header and header in loop_forest and block_name in loop_forest:
-            loop_forest[header].children.append(loop_forest[block_name])
-            loop_forest[block_name].parent = loop_forest[header]
+    # Parent header inference: the smallest containing loop that is not itself
+    def parent_header_of(h: str) -> Optional[str]:
+        candidates = [
+            cand for cand, blocks in loop_membership.items() if h in blocks and cand != h
+        ]
+        if not candidates:
+            return None
+        # Choose the smallest loop that still contains the header (approximates immediacy)
+        return min(candidates, key=lambda c: len(loop_membership[c]))
 
-    # Reverse mapping: block -> loops containing it
-    block_to_loops: Dict[str, Set[str]] = {}
-    for header, blocks in loop_membership.items():
-        for block in blocks:
-            block_to_loops.setdefault(block, set()).add(header)
+    parent_header_map: Dict[str, Optional[str]] = {
+        h: parent_header_of(h) for h in loop_membership
+    }
+
+    # Build loops in header order by RPO index
+    headers_sorted = sorted(loop_membership.keys(), key=lambda h: name_to_rpo_idx[h])
+    loop_index_by_header: Dict[str, int] = {}
+    loops: List[LoopInfo] = []
+    for h in headers_sorted:
+        blocks_in_loop = loop_membership[h]
+        begin_idx = min(name_to_rpo_idx[b] for b in blocks_in_loop)
+        end_idx = max(name_to_rpo_idx[b] for b in blocks_in_loop) + 1
+        loop_index_by_header[h] = len(loops)
+        loops.append(
+            LoopInfo(
+                header=h,
+                level=0,  # filled later
+                parent=None,  # filled later
+                begin=begin_idx,
+                end=end_idx,
+                num_blocks=len(blocks_in_loop),
+                irreducible=h in irreducible_headers,
+                reentries=[],
+            )
+        )
+
+    # Fill parent indices and levels
+    for idx, loop in enumerate(loops):
+        parent_header = parent_header_map.get(loop.header)
+        if parent_header is not None and parent_header in loop_index_by_header:
+            loop.parent = loop_index_by_header[parent_header]
+        else:
+            loop.parent = None
+
+    def compute_level(idx: int, memo: Dict[int, int]) -> int:
+        if idx in memo:
+            return memo[idx]
+        parent = loops[idx].parent
+        if parent is None:
+            memo[idx] = 0
+        else:
+            memo[idx] = compute_level(parent, memo) + 1
+        return memo[idx]
+
+    level_memo: Dict[int, int] = {}
+    for i in range(len(loops)):
+        loops[i].level = compute_level(i, level_memo)
+
+    # Attach re-entry edges to owning loop (by header match)
+    for src, dst in reentry_edges:
+        header = iloop_header.get(dst)
+        if header is None and dst in loop_membership:
+            header = dst
+        if header is not None and header in loop_index_by_header:
+            loops[loop_index_by_header[header]].reentries.append((src, dst))
+
+    # Build block_loop_map using innermost header
+    block_loop_map: List[Optional[int]] = [None for _ in block_layout]
+    for block_name in function.blocks:
+        header = iloop_header.get(block_name)
+        if header is None and block_name in loop_membership:
+            header = block_name
+        if header is None:
+            continue
+        loop_idx = loop_index_by_header.get(header)
+        if loop_idx is None:
+            continue
+        block_idx = name_to_rpo_idx[block_name]
+        block_loop_map[block_idx] = loop_idx
+
+    # Reverse mapping: block -> loops containing it (innermost up the parent chain)
+    block_to_loops: Dict[str, Set[int]] = {}
+    for idx, block_name in enumerate(block_layout):
+        loop_idx = block_loop_map[idx]
+        chain: Set[int] = set()
+        while loop_idx is not None:
+            chain.add(loop_idx)
+            loop_idx = loops[loop_idx].parent
+        if chain:
+            block_to_loops[block_name] = chain
 
     # Loop depth and exit edges
     exit_edges: Set[Tuple[str, str]] = set()
     for block_name, block in function.blocks.items():
-        block.loop_depth = len(block_to_loops.get(block_name, set()))
+        loop_set = block_to_loops.get(block_name, set())
+        block.loop_depth = len(loop_set)
 
         for succ in block.successors:
-            src_loops = block_to_loops.get(block_name, set())
+            src_loops = loop_set
             dst_loops = block_to_loops.get(succ, set())
             if src_loops and not src_loops.intersection(dst_loops):
                 exit_edges.add((block_name, succ))
 
-    return loop_forest, loop_edges, loop_membership, exit_edges, postorder, rpo, name_to_rpo_idx
+    return (
+        block_layout,
+        block_loop_map,
+        loops,
+        loop_edges,
+        exit_edges,
+        postorder,
+        rpo,
+        name_to_rpo_idx,
+    )
 
 
-def get_loop_processing_order(loop_forest: Dict[str, LoopNode], rpo: List[str]) -> List[str]:
-    """
-    Produce a list of loop headers in bottom-up order (children before parents).
-    
-    Args:
-        loop_forest: Dictionary mapping block names to LoopNodes
-        rpo: List of block names in reverse postorder (for index-to-name lookup)
-    
-    Returns:
-        List of loop header block names in bottom-up order
-    """
-    order: List[str] = []
-    visited: Set[int] = set()
+def compute_loop_membership_from_map(
+    block_layout: List[str], block_loop_map: List[Optional[int]], loops: List[LoopInfo]
+) -> Dict[int, Set[str]]:
+    """Build loop membership keyed by loop index, including ancestor loops."""
+    membership: Dict[int, Set[str]] = {i: set() for i in range(len(loops))}
+    for idx, block_name in enumerate(block_layout):
+        loop_idx = block_loop_map[idx]
+        visited: Set[int] = set()
+        while loop_idx is not None and loop_idx not in visited:
+            membership.setdefault(loop_idx, set()).add(block_name)
+            visited.add(loop_idx)
+            loop_idx = loops[loop_idx].parent
+    return membership
 
-    def dfs(node: LoopNode) -> None:
-        if node.block_idx in visited:
-            return
-        visited.add(node.block_idx)
-        for child in node.children:
-            dfs(child)
-        if node.is_loop:
-            # Look up block name from RPO index
-            if 0 <= node.block_idx < len(rpo):
-                order.append(rpo[node.block_idx])
 
-    for node in loop_forest.values():
-        if node.parent is None:
-            dfs(node)
-
-    return order
+def compute_loop_children(loops: List[LoopInfo]) -> Dict[int, List[int]]:
+    children: Dict[int, List[int]] = {i: [] for i in range(len(loops))}
+    for idx, loop in enumerate(loops):
+        if loop.parent is not None:
+            children.setdefault(loop.parent, []).append(idx)
+    return children
 
 
 def compute_initial_liveness(
     function: Function,
-    loop_forest: Dict[str, LoopNode],
-    loop_edges: Set[Tuple[str, str]],
-    loop_membership: Dict[str, Set[str]],
     exit_edges: Set[Tuple[str, str]],
     postorder: List[str],
 ) -> None:
@@ -285,9 +367,6 @@ def compute_initial_liveness(
 
     Args:
         function: The Function object
-        loop_forest: Loop forest structure
-        loop_edges: Set of loop edges to exclude
-        loop_membership: Mapping of loop headers to their member blocks
         exit_edges: Set of loop exit edges for distance penalties
         postorder: Postorder traversal of the reduced CFG FL(G)
     """
@@ -466,9 +545,10 @@ def recompute_block_live_sets(
 
 def propagate_loop_liveness_and_distances(
     function: Function,
-    loop_forest: Dict[str, LoopNode],
+    block_layout: List[str],
+    block_loop_map: List[Optional[int]],
+    loops: List[LoopInfo],
     loop_edges: Set[Tuple[str, str]],
-    loop_membership: Dict[str, Set[str]],
     exit_edges: Set[Tuple[str, str]],
     postorder: List[str],
     rpo: List[str],
@@ -478,115 +558,81 @@ def propagate_loop_liveness_and_distances(
 
     Args:
         function: The Function object
-        loop_forest: Loop forest structure
+        block_layout: List of blocks in RPO
+        block_loop_map: Loop index per block (innermost)
+        loops: Loop descriptors
         loop_edges: Set of loop edges
-        loop_membership: Mapping of loop headers to their member blocks
         exit_edges: Set of loop exit edges for distance penalties
         postorder: Postorder traversal of the reduced CFG FL(G)
         rpo: List of block names in reverse postorder (for index-to-name lookup)
     """
 
     # Track which blocks need distance recomputation
-    affected_blocks = set()
+    affected_blocks: Set[str] = set()
+    loop_membership = compute_loop_membership_from_map(block_layout, block_loop_map, loops)
+    children = compute_loop_children(loops)
 
-    def loop_tree_dfs(node: LoopNode) -> None:
-        """Recursive DFS traversal of the loop forest (Algorithm 3)."""
-        if node.is_loop:
-            # Collect all live val_idx in this loop (not distances)
-            loop_live_vars = set()
+    def gather_blocks(loop_idx: int, acc: Set[str]) -> None:
+        """Collect blocks for a loop and its nested children."""
+        acc.update(loop_membership.get(loop_idx, set()))
+        for child in children.get(loop_idx, []):
+            gather_blocks(child, acc)
 
-            # Look up block name from RPO index
-            block_name = rpo[node.block_idx] if 0 <= node.block_idx < len(rpo) else None
-            if block_name is None:
-                return
+    def loop_tree_dfs(loop_idx: int) -> None:
+        """Recursive traversal mirroring Algorithm 3."""
+        loop_blocks_all: Set[str] = set()
+        gather_blocks(loop_idx, loop_blocks_all)
+        if not loop_blocks_all:
+            return
 
-            # Add live vars from the loop header
-            block_n = function.blocks[block_name]
-            loop_live_vars.update(block_n.live_in.keys())
-            loop_live_vars.update(block_n.live_out.keys())
+        loop_live_vars: Set[int] = set()
+        for block_name in loop_blocks_all:
+            block = function.blocks[block_name]
+            loop_live_vars.update(block.live_in.keys())
+            loop_live_vars.update(block.live_out.keys())
 
-            # Add live vars from all children (recursive)
-            def collect_live_vars(n: LoopNode) -> None:
-                child_block_name = rpo[n.block_idx] if 0 <= n.block_idx < len(rpo) else None
-                if child_block_name is None:
-                    return
-                block = function.blocks[child_block_name]
-                loop_live_vars.update(block.live_in.keys())
-                loop_live_vars.update(block.live_out.keys())
-                for child in n.children:
-                    collect_live_vars(child)
-
-            for child in node.children:
-                collect_live_vars(child)
-
-            # Propagate all loop live vars to the header and children (with placeholder distances)
+        # Propagate placeholders to all blocks in this loop and nested loops
+        for block_name in loop_blocks_all:
+            block = function.blocks[block_name]
             for val_idx in loop_live_vars:
-                # Don't add variables to live_in if they're defined in this block
-                if val_idx not in block_n.def_set and val_idx not in block_n.phi_defs:
-                    block_n.live_in[val_idx] = block_n.live_in.get(
-                        val_idx, float("inf")
-                    )
-                block_n.live_out[val_idx] = block_n.live_out.get(val_idx, float("inf"))
-
-            for child in node.children:
-                child_block_name = rpo[child.block_idx] if 0 <= child.block_idx < len(rpo) else None
-                if child_block_name is None:
-                    continue
-                block_m = function.blocks[child_block_name]
-                for val_idx in loop_live_vars:
-                    # Don't add variables to live_in if they're defined in this block
-                    if (
-                        val_idx not in block_m.def_set
-                        and val_idx not in block_m.phi_defs
-                    ):
-                        block_m.live_in[val_idx] = block_m.live_in.get(
-                            val_idx, float("inf")
-                        )
-                    block_m.live_out[val_idx] = block_m.live_out.get(
-                        val_idx, float("inf")
-                    )
-
-                # Mark child block for recomputation
-                affected_blocks.add(child_block_name)
-                # Recursively process child
-                loop_tree_dfs(child)
-
-            # Mark header block for recomputation
+                if val_idx not in block.def_set and val_idx not in block.phi_defs:
+                    block.live_in[val_idx] = block.live_in.get(val_idx, float("inf"))
+                block.live_out[val_idx] = block.live_out.get(val_idx, float("inf"))
             affected_blocks.add(block_name)
 
-    # Start from root nodes (nodes with no parent)
-    roots = [node for node in loop_forest.values() if node.parent is None]
-    for root in roots:
+        # Recurse into child loops
+        for child in children.get(loop_idx, []):
+            loop_tree_dfs(child)
+
+    # Start from root loops (parent is None)
+    root_indices = [idx for idx, loop in enumerate(loops) if loop.parent is None]
+    for root in root_indices:
         loop_tree_dfs(root)
 
-    # Compute loop-aware next-use distances using BFS
-    if loop_membership:
-        # Process loops in bottom-up order (inner loops first)
-        loop_order = get_loop_processing_order(loop_forest, rpo)
+    # Compute loop-aware next-use distances using BFS (inner loops first)
+    if loops:
+        loop_order = sorted(range(len(loops)), key=lambda i: loops[i].level, reverse=True)
 
-        for header in loop_order:
-            blocks = loop_membership.get(header, set())
+        for loop_idx in loop_order:
+            blocks = loop_membership.get(loop_idx, set())
+            header = loops[loop_idx].header
             if not blocks or header not in function.blocks:
                 continue
 
             header_block = function.blocks[header]
-            # Collect all live variables in this loop
             loop_live_vars = set(header_block.live_in.keys())
             loop_live_vars.update(header_block.live_out.keys())
 
-            # Also collect from nested loops
-            for child_node in loop_forest[header].children:
-                if child_node.is_loop:
-                    child_block_name = rpo[child_node.block_idx] if 0 <= child_node.block_idx < len(rpo) else None
-                    if child_block_name is None:
-                        continue
-                    child_block = function.blocks[child_block_name]
-                    loop_live_vars.update(child_block.live_in.keys())
-                    loop_live_vars.update(child_block.live_out.keys())
+            # Also collect live vars from nested loops/blocks
+            nested_blocks: Set[str] = set()
+            gather_blocks(loop_idx, nested_blocks)
+            for blk_name in nested_blocks:
+                blk = function.blocks[blk_name]
+                loop_live_vars.update(blk.live_in.keys())
+                loop_live_vars.update(blk.live_out.keys())
 
-            # BFS from header to find minimum distance to first use of each live variable
             min_dist: Dict[int, float] = {}
-            visited = set()
+            visited: Set[str] = set()
             queue = deque([(header, 0)])  # (block_name, distance_from_header_entry)
 
             while queue:
@@ -627,7 +673,6 @@ def propagate_loop_liveness_and_distances(
                                     if var in function.value_indices:
                                         val_idx = function.value_indices[var]
                                         if val_idx in loop_live_vars:
-                                            # Phi use is at distance block_len from block entry
                                             use_dist = dist + block_len
                                             if (
                                                 val_idx not in min_dist
@@ -641,7 +686,6 @@ def propagate_loop_liveness_and_distances(
                         queue.append((succ, dist + block_len))
 
             # Update header's live_in with computed minimum distances
-            # Only update variables that are not defined in the header
             for val_idx, d in min_dist.items():
                 if (
                     val_idx not in header_block.def_set
@@ -649,9 +693,6 @@ def propagate_loop_liveness_and_distances(
                 ):
                     if d < header_block.live_in.get(val_idx, math.inf):
                         header_block.live_in[val_idx] = d
-
-            # Mark all loop blocks for recomputation
-            # affected_blocks.update(blocks)
 
     # Recompute distances for all affected blocks in postorder
     if affected_blocks:
@@ -705,7 +746,15 @@ def get_next_use_distance(
     return math.inf
 
 
-def compute_liveness(function: Function) -> Dict[str, Set[str]]:
+def compute_liveness(
+    function: Function,
+) -> Tuple[
+    List[str],
+    List[Optional[int]],
+    List[LoopInfo],
+    Set[Tuple[str, str]],
+    Set[Tuple[str, str]],
+]:
     """
     Main function that orchestrates the two-phase liveness analysis.
 
@@ -713,24 +762,38 @@ def compute_liveness(function: Function) -> Dict[str, Set[str]]:
         function: The Function object to analyze
 
     Returns:
-        Dictionary mapping loop headers to sets of blocks in each loop (loop_membership)
+        (block_layout, block_loop_map, loops, loop_edges, exit_edges)
     """
     # Phase 0: Setup
     compute_predecessors_and_use_def_sets(function)
 
     # Build loop forest and identify loop edges
-    loop_forest, loop_edges, loop_membership, exit_edges, postorder, rpo, name_to_rpo_idx = build_loop_forest(
+    (
+        block_layout,
+        block_loop_map,
+        loops,
+        loop_edges,
+        exit_edges,
+        postorder,
+        rpo,
+        name_to_rpo_idx,
+    ) = build_loop_forest(
         function
     )
 
     # Phase 1: Initial liveness computation
-    compute_initial_liveness(
-        function, loop_forest, loop_edges, loop_membership, exit_edges, postorder
-    )
+    compute_initial_liveness(function, exit_edges, postorder)
 
     # Phase 2: Loop propagation and distance computation
     propagate_loop_liveness_and_distances(
-        function, loop_forest, loop_edges, loop_membership, exit_edges, postorder, rpo
+        function,
+        block_layout,
+        block_loop_map,
+        loops,
+        loop_edges,
+        exit_edges,
+        postorder,
+        rpo,
     )
 
-    return loop_membership
+    return block_layout, block_loop_map, loops, loop_edges, exit_edges

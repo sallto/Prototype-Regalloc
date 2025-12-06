@@ -983,7 +983,7 @@ def test_parser(ir_file: str, k: int = 3) -> None:
 
         # Compute liveness
         print("Computing liveness analysis...")
-        loop_membership = liveness.compute_liveness(function)
+        block_layout, block_loop_map, loops, loop_edges, exit_edges = liveness.compute_liveness(function)
         print("Liveness analysis completed!")
 
 
@@ -1009,7 +1009,9 @@ def test_parser(ir_file: str, k: int = 3) -> None:
 
         # Run the Min algorithm for register allocation
         print(f"Running Min algorithm with k={k}...")
-        spills_reloads = min_algorithm.min_algorithm(function, loop_membership, k=k)
+        spills_reloads = min_algorithm.min_algorithm(
+            function, block_layout, block_loop_map, loops, k=k
+        )
         print("Min algorithm completed!")
         print()
 
@@ -1021,7 +1023,7 @@ def test_parser(ir_file: str, k: int = 3) -> None:
 
         # Run SSA-based coloring
         print(f"Running SSA-based coloring with k={k}...")
-        color_program(function, k=k, spills_reloads=spills_reloads, loop_membership=loop_membership)
+        color_program(function, k=k, spills_reloads=spills_reloads)
         print("Coloring completed!")
         print()
 

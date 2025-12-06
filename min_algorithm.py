@@ -14,8 +14,8 @@ import math
 import bisect
 from typing import Dict, List, Set, Union, Tuple, Optional
 from dataclasses import dataclass
-from ir import Function, Block, Op, Jump, Phi
-from liveness import get_next_use_distance
+from ir import Function, Block, Op, Phi
+from liveness import get_next_use_distance, compute_loop_membership_from_map, LoopInfo
 def topological_order(function: Function) -> List[str]:
     """
     Return blocks in topological order (predecessors before successors).
@@ -244,25 +244,38 @@ def initUsual(block: Block, pred_W_exits: Dict[str, Set[int]], k: int, function:
     return take | selected_cand
 
 
-def loopOf(block_name: str, loop_membership: Dict[str, Set[str]]) -> Union[str, None]:
+def loopOf(
+    block_name: str,
+    block_index_map: Dict[str, int],
+    block_loop_map: List[Optional[int]],
+    loops: List[LoopInfo],
+) -> Union[str, None]:
     """
     Find which loop header (if any) contains the given block.
 
     Args:
         block_name: Name of the block to check
-        loop_membership: Dictionary mapping loop headers to sets of blocks in each loop
+        block_index_map: Mapping of block name to index in block_layout
+        block_loop_map: Loop index per block
+        loops: Loop descriptors
 
     Returns:
         Loop header name if block is in a loop, None otherwise
     """
-    for loop_header, loop_blocks in loop_membership.items():
-        if block_name in loop_blocks:
-            return loop_header
-    return None
+    if block_name not in block_index_map:
+        return None
+    loop_idx = block_loop_map[block_index_map[block_name]]
+    if loop_idx is None:
+        return None
+    return loops[loop_idx].header
 
 
-def usedInLoop(loop_header: str, alive_vars: Set[int], loop_membership: Dict[str, Set[str]],
-                function: Function) -> Set[int]:
+def usedInLoop(
+    loop_header: str,
+    alive_vars: Set[int],
+    loop_membership: Dict[str, Set[str]],
+    function: Function,
+) -> Set[int]:
     """
     Return variables from alive_vars that are used in any block within the loop.
 
@@ -294,8 +307,9 @@ def usedInLoop(loop_header: str, alive_vars: Set[int], loop_membership: Dict[str
     return used_vars
 
 
-def getLoopMaxPressure(loop_header: str, loop_membership: Dict[str, Set[str]],
-                       function: Function) -> int:
+def getLoopMaxPressure(
+    loop_header: str, loop_membership: Dict[str, Set[str]], function: Function
+) -> int:
     """
     Compute maximum register pressure across all blocks in the loop.
 
@@ -364,8 +378,13 @@ def is_variable_defined_at_position(block: Block, var: str, position: int) -> bo
     return False
 
 
-def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
-                   function: Function, k: int) -> Tuple[Set[int], Set[int]]:
+def initLoopHeader(
+    block: Block,
+    loop_header: Optional[str],
+    loop_membership: Dict[str, Set[str]],
+    function: Function,
+    k: int,
+) -> Tuple[Set[int], Set[int]]:
     """
     Initialize W_entry for a loop header block according to the Min algorithm.
 
@@ -381,10 +400,10 @@ def initLoopHeader(block: Block, loop_membership: Dict[str, Set[str]],
         - Set of value indices that should be spilled before entering the loop
     """
     entry = 0  # Index of the first instruction
-    loop = loopOf(block.name, loop_membership)
+    loop = loop_header
 
     # If block is not in a loop, return empty set
-    if loop is None:
+    if loop is None or loop not in loop_membership:
         return set(), set()
 
     # alive = block.phis ∪ block.liveIn (already val_idx)
@@ -577,7 +596,13 @@ def insert_coupling_code_for_edge(pred_name: str, block_name: str, W_entry: Set[
             insert_spill_reload_sorted(result[pred_name], SpillReload("spill", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
 
-def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: int = 3) -> Dict[str, List[SpillReload]]:
+def min_algorithm(
+    function: Function,
+    block_layout: List[str],
+    block_loop_map: List[Optional[int]],
+    loops: List[LoopInfo],
+    k: int = 3,
+) -> Dict[str, List[SpillReload]]:
     """
     Implement the Min algorithm for register allocation with spilling across multiple blocks.
 
@@ -586,7 +611,9 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
 
     Args:
         function: Function to perform register allocation on
-        loop_membership: Dictionary mapping loop headers to sets of blocks in each loop
+        block_layout: Blocks in layout (RPO)
+        block_loop_map: Loop index per block (innermost)
+        loops: Loop descriptors
         k: Number of available registers (default 3)
 
     Returns:
@@ -594,6 +621,12 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
     """
     # Initialize result dictionary for all blocks
     result = {block_name: [] for block_name in function.blocks.keys()}
+
+    block_index_map = {name: idx for idx, name in enumerate(block_layout)}
+    membership_idx = compute_loop_membership_from_map(block_layout, block_loop_map, loops)
+    membership_by_header: Dict[str, Set[str]] = {
+        loops[i].header: membership_idx.get(i, set()) for i in range(len(loops))
+    }
 
     # Get blocks in topological order
     block_order = topological_order(function)
@@ -608,6 +641,8 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
     # Process each block in topological order
     for block_name in block_order:
         block = function.blocks[block_name]
+        loop_header = loopOf(block_name, block_index_map, block_loop_map, loops)
+        is_loop_header = loop_header == block_name
         
         # First, compute which variables are available from ALL processed predecessors
         processed_preds = list()
@@ -625,15 +660,20 @@ def min_algorithm(function: Function, loop_membership: Dict[str, Set[str]], k: i
             S_entry = set()
         else:
    
-            # Check if this block is a loop header
-            if block_name in loop_membership:
-                # Use initLoopHeader for loop headers
-                W_entry, liveThrough = initLoopHeader(block, loop_membership, function, k)
+            # Loop headers use specialized initialization
+            if is_loop_header and loop_header in membership_by_header:
+                W_entry, liveThrough = initLoopHeader(
+                    block, loop_header, membership_by_header, function, k
+                )
                 S_entry = liveThrough
             else:
-                # Use initUsual for non-loop headers
-                pred_W_exits = {pred: W_exit_map.get(pred, set()) for pred in block.predecessors}
-                W_entry = initUsual(block, pred_W_exits, k, function, vars_available_from_all)
+                # Non-headers use the usual initialization
+                pred_W_exits = {
+                    pred: W_exit_map.get(pred, set()) for pred in block.predecessors
+                }
+                W_entry = initUsual(
+                    block, pred_W_exits, k, function, vars_available_from_all
+                )
                 S_entry = set()
 
             # Compute S_entry: variables spilled on some path to this block or not in W_entry but live_out
