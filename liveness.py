@@ -84,146 +84,160 @@ def build_loop_forest(
     Dict[str, int],
 ]:
     """
-    Build loop-nesting forest for reducible graphs and identify loop edges.
-
-    Args:
-        function: The Function object with blocks
+    Build loop-nesting forest using the one-pass DFS tagging algorithm of
+    Wei et al. (“A New Algorithm for Identifying Loops in Decompilation”).
 
     Returns:
         Tuple of (loop_forest_dict, loop_edges_set, loop_membership_dict, exit_edges_set, postorder, rpo, name_to_rpo_idx)
         - loop_forest_dict: Maps block names to their LoopNode in the forest
-        - loop_edges_set: Set of (source, target) tuples that are loop edges
+        - loop_edges_set: Set of (source, target) tuples that are loop/back edges
         - loop_membership_dict: Maps loop headers to sets of blocks in each loop
         - exit_edges_set: Set of (source, target) tuples that are loop exit edges
-        - postorder: List of block names in postorder traversal of the reduced CFG FL(G)
+        - postorder: List of block names in postorder traversal
         - rpo: List of block names in reverse postorder (RPO) traversal
         - name_to_rpo_idx: Dictionary mapping block names to their RPO indices
     """
-    # This is a simplified implementation for reducible graphs
-    # A full implementation would use Tarjan's algorithm or similar
 
-    # For now, implement a basic DFS-based loop detection
-    # This assumes the graph is reducible (as per the problem statement)
+    # Per-block transient metadata
+    traversed: Set[str] = set()
+    dfsp_pos: Dict[str, int] = {name: 0 for name in function.blocks}
+    iloop_header: Dict[str, str] = {name: None for name in function.blocks}
+    is_loop_header: Set[str] = set()
+    irreducible_headers: Set[str] = set()
+    reentry_edges: Set[Tuple[str, str]] = set()
+    loop_edges: Set[Tuple[str, str]] = set()
+    postorder: List[str] = []
 
-    visited = set()
-    visiting = set()
-    loop_headers = set()
-    back_edges = set()
-    loop_forest = {}
-    postorder = []
-
-    def dfs(block_name: str, predecessor: str = None):
-        """DFS traversal to find loops and build forest structure."""
-        if block_name in visiting:
-            # Found a back edge - this indicates a loop
-            loop_headers.add(block_name)
-            # The back edge is from predecessor to block_name
-            if predecessor is not None:
-                back_edges.add((predecessor, block_name))
+    def tag_lhead(b: str, h: str) -> None:
+        """Weave header h into the loop-header list of b according to DFSP positions."""
+        if h is None or b == h:
             return
 
-        if block_name in visited:
-            return
+        cur1, cur2 = b, h
+        while iloop_header[cur1] is not None:
+            ih = iloop_header[cur1]
+            if ih == cur2:
+                return
+            if dfsp_pos[ih] < dfsp_pos[cur2]:
+                iloop_header[cur1] = cur2
+                cur1, cur2 = cur2, ih
+            else:
+                cur1 = ih
+        iloop_header[cur1] = cur2
 
-        visiting.add(block_name)
+    def trav_loops_dfs(b0: str, pos: int) -> str:
+        """Single-pass DFS that tags loop headers on demand."""
+        traversed.add(b0)
+        dfsp_pos[b0] = pos
 
-        for successor in function.blocks[block_name].successors:
-            dfs(successor, block_name)
+        for succ in function.blocks[b0].successors:
+            if succ not in function.blocks:
+                continue
 
-        visiting.remove(block_name)
-        visited.add(block_name)
-        postorder.append(block_name)
+            if succ not in traversed:
+                # Case (A): new node
+                nh = trav_loops_dfs(succ, pos + 1)
+                tag_lhead(b0, nh)
+            else:
+                if dfsp_pos[succ] > 0:
+                    # Case (B): back edge to DFSP
+                    is_loop_header.add(succ)
+                    loop_edges.add((b0, succ))
+                    tag_lhead(b0, succ)
+                elif iloop_header[succ] is None:
+                    # Case (C): traversed, not on path, not in a loop body
+                    continue
+                else:
+                    h = iloop_header[succ]
+                    if h is None:
+                        continue
+                    if dfsp_pos[h] > 0:
+                        # Case (D): successor in loop; header on current path
+                        tag_lhead(b0, h)
+                    else:
+                        # Case (E): re-entry into loop not on current path
+                        reentry_edges.add((b0, succ))
+                        irreducible_headers.add(h)
+                        while iloop_header[h] is not None:
+                            h = iloop_header[h]
+                            if dfsp_pos[h] > 0:
+                                tag_lhead(b0, h)
+                                break
+                            irreducible_headers.add(h)
 
-    # Find a root block (one with no predecessors)
-    root_candidates = [
-        name for name, block in function.blocks.items() if not block.predecessors
-    ]
+        postorder.append(b0)
+        dfsp_pos[b0] = 0  # clear DFSP position
+        return iloop_header[b0]
 
-    if not root_candidates:
-        # If no blocks have no predecessors, pick any block as root
-        root_candidates = list(function.blocks.keys())[:1]
+    # Pick entry roots: blocks without predecessors, or fall back to an arbitrary block
+    roots = [name for name, block in function.blocks.items() if not block.predecessors]
+    if not roots and function.blocks:
+        roots = [next(iter(function.blocks))]
 
-    # Start DFS from each root candidate
-    for root in root_candidates:
-        if root not in visited:
-            dfs(root)
+    # Traverse all reachable components
+    for root in roots:
+        if root not in traversed:
+            trav_loops_dfs(root, 1)
 
-    # Compute RPO (reverse postorder)
+    # Visit any remaining disconnected blocks to ensure coverage
+    for name in function.blocks:
+        if name not in traversed:
+            trav_loops_dfs(name, 1)
+
+    # RPO and index mapping
     rpo = list(reversed(postorder))
     name_to_rpo_idx = {block_name: idx for idx, block_name in enumerate(rpo)}
 
-    # Create LoopNode for each block in RPO using RPO index
+    # Create LoopNode instances
+    loop_forest: Dict[str, LoopNode] = {}
     for block_name in rpo:
         block_idx = name_to_rpo_idx[block_name]
         loop_forest[block_name] = LoopNode(
-            block_idx=block_idx, is_loop=block_name in loop_headers, children=[]
+            block_idx=block_idx,
+            is_loop=block_name in is_loop_header,
+            children=[],
         )
+        # Optional irreducible marker on headers
+        if block_name in irreducible_headers:
+            setattr(loop_forest[block_name], "irreducible", True)
 
-    # Find a root block (one with no predecessors)
-    root_candidates = [
-        name for name, block in function.blocks.items() if not block.predecessors
-    ]
+    # Compute loop membership from tagged headers (include nested headers)
+    loop_membership: Dict[str, Set[str]] = {}
+    for block_name in function.blocks:
+        header = iloop_header[block_name]
+        seen: Set[str] = set()
+        while header is not None and header not in seen:
+            loop_membership.setdefault(header, set()).add(block_name)
+            seen.add(header)
+            header = iloop_header.get(header)
+    for header in is_loop_header:
+        loop_membership.setdefault(header, set()).add(header)
 
-    if not root_candidates:
-        # If no blocks have no predecessors, pick any block as root
-        root_candidates = list(function.blocks.keys())[:1]
+    # Build parent-child relationships based on immediate innermost header
+    for block_name in function.blocks:
+        header = iloop_header[block_name]
+        if header and header in loop_forest and block_name in loop_forest:
+            loop_forest[header].children.append(loop_forest[block_name])
+            loop_forest[block_name].parent = loop_forest[header]
 
-    # Start DFS from each root candidate
-    for root in root_candidates:
-        if root not in visited:
-            dfs(root)
+    # Reverse mapping: block -> loops containing it
+    block_to_loops: Dict[str, Set[str]] = {}
+    for header, blocks in loop_membership.items():
+        for block in blocks:
+            block_to_loops.setdefault(block, set()).add(header)
 
-    # Build parent-child relationships in the forest
-    # For this simplified version, we'll create a basic tree structure
-    # A full implementation would need proper loop nesting analysis
-
-    # Compute loop membership
-    loop_membership = {}
-    for block_name, node in loop_forest.items():
-        if node.is_loop:
-            loop_header = block_name
-            loop_blocks = {loop_header}
-            # Add all sources of back edges to this header
-            for src, tgt in back_edges:
-                if tgt == loop_header:
-                    loop_blocks.add(src)
-            loop_membership[loop_header] = loop_blocks
-
-    # Build hierarchy based on loop membership
-    for loop_header, loop_blocks in loop_membership.items():
-        for block in loop_blocks:
-            if block != loop_header and block in loop_forest:
-                loop_forest[loop_header].children.append(loop_forest[block])
-                loop_forest[block].parent = loop_forest[loop_header]
-
-    # Compute loop exit edges
-    # An exit edge is an edge (src, dst) where src is in a loop but dst is not in the same loop
-    exit_edges = set()
-
-    # Create reverse mapping: block -> set of loops it belongs to
-    block_to_loops = {}
-    for loop_header, loop_blocks in loop_membership.items():
-        for block in loop_blocks:
-            if block not in block_to_loops:
-                block_to_loops[block] = set()
-            block_to_loops[block].add(loop_header)
-
-    # Compute loop depth for each block (number of loops it belongs to)
+    # Loop depth and exit edges
+    exit_edges: Set[Tuple[str, str]] = set()
     for block_name, block in function.blocks.items():
         block.loop_depth = len(block_to_loops.get(block_name, set()))
 
-    # Check each edge in the CFG
-    for src_block_name, src_block in function.blocks.items():
-        for dst_block_name in src_block.successors:
-            # Check if src is in any loop
-            src_loops = block_to_loops.get(src_block_name, set())
-            dst_loops = block_to_loops.get(dst_block_name, set())
+        for succ in block.successors:
+            src_loops = block_to_loops.get(block_name, set())
+            dst_loops = block_to_loops.get(succ, set())
+            if src_loops and not src_loops.intersection(dst_loops):
+                exit_edges.add((block_name, succ))
 
-            # If src is in a loop but dst is not in any of the same loops, it's an exit edge
-            if src_loops and not dst_loops.intersection(src_loops):
-                exit_edges.add((src_block_name, dst_block_name))
-
-    return loop_forest, back_edges, loop_membership, exit_edges, postorder, rpo, name_to_rpo_idx
+    return loop_forest, loop_edges, loop_membership, exit_edges, postorder, rpo, name_to_rpo_idx
 
 
 def get_loop_processing_order(loop_forest: Dict[str, LoopNode], rpo: List[str]) -> List[str]:
