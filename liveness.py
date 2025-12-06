@@ -11,7 +11,7 @@ from ir import Block, Function, Op, Phi, val_as_phi
 class LoopNode:
     """Represents a node in the loop-nesting forest."""
 
-    block_name: str  # Name of the block (or loop header)
+    block_idx: int  # RPO index of the block (or loop header)
     is_loop: bool  # True if this represents a loop header
     children: List["LoopNode"]
     parent: "LoopNode" = None
@@ -80,6 +80,8 @@ def build_loop_forest(
     Dict[str, Set[str]],
     Set[Tuple[str, str]],
     List[str],
+    List[str],
+    Dict[str, int],
 ]:
     """
     Build loop-nesting forest for reducible graphs and identify loop edges.
@@ -88,12 +90,14 @@ def build_loop_forest(
         function: The Function object with blocks
 
     Returns:
-        Tuple of (loop_forest_dict, loop_edges_set, loop_membership_dict, exit_edges_set, postorder)
+        Tuple of (loop_forest_dict, loop_edges_set, loop_membership_dict, exit_edges_set, postorder, rpo, name_to_rpo_idx)
         - loop_forest_dict: Maps block names to their LoopNode in the forest
         - loop_edges_set: Set of (source, target) tuples that are loop edges
         - loop_membership_dict: Maps loop headers to sets of blocks in each loop
         - exit_edges_set: Set of (source, target) tuples that are loop exit edges
         - postorder: List of block names in postorder traversal of the reduced CFG FL(G)
+        - rpo: List of block names in reverse postorder (RPO) traversal
+        - name_to_rpo_idx: Dictionary mapping block names to their RPO indices
     """
     # This is a simplified implementation for reducible graphs
     # A full implementation would use Tarjan's algorithm or similar
@@ -130,9 +134,29 @@ def build_loop_forest(
         visited.add(block_name)
         postorder.append(block_name)
 
-        # Create LoopNode for this block
+    # Find a root block (one with no predecessors)
+    root_candidates = [
+        name for name, block in function.blocks.items() if not block.predecessors
+    ]
+
+    if not root_candidates:
+        # If no blocks have no predecessors, pick any block as root
+        root_candidates = list(function.blocks.keys())[:1]
+
+    # Start DFS from each root candidate
+    for root in root_candidates:
+        if root not in visited:
+            dfs(root)
+
+    # Compute RPO (reverse postorder)
+    rpo = list(reversed(postorder))
+    name_to_rpo_idx = {block_name: idx for idx, block_name in enumerate(rpo)}
+
+    # Create LoopNode for each block in RPO using RPO index
+    for block_name in rpo:
+        block_idx = name_to_rpo_idx[block_name]
         loop_forest[block_name] = LoopNode(
-            block_name=block_name, is_loop=block_name in loop_headers, children=[]
+            block_idx=block_idx, is_loop=block_name in loop_headers, children=[]
         )
 
     # Find a root block (one with no predecessors)
@@ -155,15 +179,15 @@ def build_loop_forest(
 
     # Compute loop membership
     loop_membership = {}
-    for loop_header in [
-        node.block_name for node in loop_forest.values() if node.is_loop
-    ]:
-        loop_blocks = {loop_header}
-        # Add all sources of back edges to this header
-        for src, tgt in back_edges:
-            if tgt == loop_header:
-                loop_blocks.add(src)
-        loop_membership[loop_header] = loop_blocks
+    for block_name, node in loop_forest.items():
+        if node.is_loop:
+            loop_header = block_name
+            loop_blocks = {loop_header}
+            # Add all sources of back edges to this header
+            for src, tgt in back_edges:
+                if tgt == loop_header:
+                    loop_blocks.add(src)
+            loop_membership[loop_header] = loop_blocks
 
     # Build hierarchy based on loop membership
     for loop_header, loop_blocks in loop_membership.items():
@@ -199,24 +223,33 @@ def build_loop_forest(
             if src_loops and not dst_loops.intersection(src_loops):
                 exit_edges.add((src_block_name, dst_block_name))
 
-    return loop_forest, back_edges, loop_membership, exit_edges, postorder
+    return loop_forest, back_edges, loop_membership, exit_edges, postorder, rpo, name_to_rpo_idx
 
 
-def get_loop_processing_order(loop_forest: Dict[str, LoopNode]) -> List[str]:
+def get_loop_processing_order(loop_forest: Dict[str, LoopNode], rpo: List[str]) -> List[str]:
     """
     Produce a list of loop headers in bottom-up order (children before parents).
+    
+    Args:
+        loop_forest: Dictionary mapping block names to LoopNodes
+        rpo: List of block names in reverse postorder (for index-to-name lookup)
+    
+    Returns:
+        List of loop header block names in bottom-up order
     """
     order: List[str] = []
-    visited: Set[str] = set()
+    visited: Set[int] = set()
 
     def dfs(node: LoopNode) -> None:
-        if node.block_name in visited:
+        if node.block_idx in visited:
             return
-        visited.add(node.block_name)
+        visited.add(node.block_idx)
         for child in node.children:
             dfs(child)
         if node.is_loop:
-            order.append(node.block_name)
+            # Look up block name from RPO index
+            if 0 <= node.block_idx < len(rpo):
+                order.append(rpo[node.block_idx])
 
     for node in loop_forest.values():
         if node.parent is None:
@@ -424,6 +457,7 @@ def propagate_loop_liveness_and_distances(
     loop_membership: Dict[str, Set[str]],
     exit_edges: Set[Tuple[str, str]],
     postorder: List[str],
+    rpo: List[str],
 ) -> None:
     """
     Combined phase: Propagate liveness within loop bodies and compute next-use distances.
@@ -435,6 +469,7 @@ def propagate_loop_liveness_and_distances(
         loop_membership: Mapping of loop headers to their member blocks
         exit_edges: Set of loop exit edges for distance penalties
         postorder: Postorder traversal of the reduced CFG FL(G)
+        rpo: List of block names in reverse postorder (for index-to-name lookup)
     """
 
     # Track which blocks need distance recomputation
@@ -446,14 +481,22 @@ def propagate_loop_liveness_and_distances(
             # Collect all live val_idx in this loop (not distances)
             loop_live_vars = set()
 
+            # Look up block name from RPO index
+            block_name = rpo[node.block_idx] if 0 <= node.block_idx < len(rpo) else None
+            if block_name is None:
+                return
+
             # Add live vars from the loop header
-            block_n = function.blocks[node.block_name]
+            block_n = function.blocks[block_name]
             loop_live_vars.update(block_n.live_in.keys())
             loop_live_vars.update(block_n.live_out.keys())
 
             # Add live vars from all children (recursive)
             def collect_live_vars(n: LoopNode) -> None:
-                block = function.blocks[n.block_name]
+                child_block_name = rpo[n.block_idx] if 0 <= n.block_idx < len(rpo) else None
+                if child_block_name is None:
+                    return
+                block = function.blocks[child_block_name]
                 loop_live_vars.update(block.live_in.keys())
                 loop_live_vars.update(block.live_out.keys())
                 for child in n.children:
@@ -472,7 +515,10 @@ def propagate_loop_liveness_and_distances(
                 block_n.live_out[val_idx] = block_n.live_out.get(val_idx, float("inf"))
 
             for child in node.children:
-                block_m = function.blocks[child.block_name]
+                child_block_name = rpo[child.block_idx] if 0 <= child.block_idx < len(rpo) else None
+                if child_block_name is None:
+                    continue
+                block_m = function.blocks[child_block_name]
                 for val_idx in loop_live_vars:
                     # Don't add variables to live_in if they're defined in this block
                     if (
@@ -487,12 +533,12 @@ def propagate_loop_liveness_and_distances(
                     )
 
                 # Mark child block for recomputation
-                affected_blocks.add(child.block_name)
+                affected_blocks.add(child_block_name)
                 # Recursively process child
                 loop_tree_dfs(child)
 
             # Mark header block for recomputation
-            affected_blocks.add(node.block_name)
+            affected_blocks.add(block_name)
 
     # Start from root nodes (nodes with no parent)
     roots = [node for node in loop_forest.values() if node.parent is None]
@@ -502,7 +548,7 @@ def propagate_loop_liveness_and_distances(
     # Compute loop-aware next-use distances using BFS
     if loop_membership:
         # Process loops in bottom-up order (inner loops first)
-        loop_order = get_loop_processing_order(loop_forest)
+        loop_order = get_loop_processing_order(loop_forest, rpo)
 
         for header in loop_order:
             blocks = loop_membership.get(header, set())
@@ -517,7 +563,10 @@ def propagate_loop_liveness_and_distances(
             # Also collect from nested loops
             for child_node in loop_forest[header].children:
                 if child_node.is_loop:
-                    child_block = function.blocks[child_node.block_name]
+                    child_block_name = rpo[child_node.block_idx] if 0 <= child_node.block_idx < len(rpo) else None
+                    if child_block_name is None:
+                        continue
+                    child_block = function.blocks[child_block_name]
                     loop_live_vars.update(child_block.live_in.keys())
                     loop_live_vars.update(child_block.live_out.keys())
 
@@ -656,7 +705,7 @@ def compute_liveness(function: Function) -> Dict[str, Set[str]]:
     compute_predecessors_and_use_def_sets(function)
 
     # Build loop forest and identify loop edges
-    loop_forest, loop_edges, loop_membership, exit_edges, postorder = build_loop_forest(
+    loop_forest, loop_edges, loop_membership, exit_edges, postorder, rpo, name_to_rpo_idx = build_loop_forest(
         function
     )
 
@@ -667,7 +716,7 @@ def compute_liveness(function: Function) -> Dict[str, Set[str]]:
 
     # Phase 2: Loop propagation and distance computation
     propagate_loop_liveness_and_distances(
-        function, loop_forest, loop_edges, loop_membership, exit_edges, postorder
+        function, loop_forest, loop_edges, loop_membership, exit_edges, postorder, rpo
     )
 
     return loop_membership
