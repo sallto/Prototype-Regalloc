@@ -255,10 +255,18 @@ def print_function(function: Function, idom: dict = None, dom_tree: dict = None)
         print(f"    PhiUses: {phi_uses_names if phi_uses_names else 'empty'}")
         print(f"    PhiDefs: {phi_defs_names if phi_defs_names else 'empty'}")
         print(f"    Max Register Pressure: {block.max_register_pressure}")
-        live_in_str = ', '.join(f"{get_val_name(function, val_idx)}:{dist:.0f}" if dist != float('inf') else f"{get_val_name(function, val_idx)}:inf"
-                               for val_idx, dist in sorted(block.live_in.items())) if isinstance(block.live_in, dict) and block.live_in else 'empty'
-        live_out_str = ', '.join(f"{get_val_name(function, val_idx)}:{dist:.0f}" if dist != float('inf') else f"{get_val_name(function, val_idx)}:inf"
-                                for val_idx, dist in sorted(block.live_out.items())) if isinstance(block.live_out, dict) and block.live_out else 'empty'
+        live_in_str = ', '.join(
+            f"{get_val_name(function, val_idx)}:{dist}"
+            if dist != U32_MAX
+            else f"{get_val_name(function, val_idx)}:inf"
+            for val_idx, dist in sorted(block.live_in.items())
+        ) if isinstance(block.live_in, dict) and block.live_in else 'empty'
+        live_out_str = ', '.join(
+            f"{get_val_name(function, val_idx)}:{dist}"
+            if dist != U32_MAX
+            else f"{get_val_name(function, val_idx)}:inf"
+            for val_idx, dist in sorted(block.live_out.items())
+        ) if isinstance(block.live_out, dict) and block.live_out else 'empty'
         print(f"    LiveIn: {{{live_in_str}}}")
         print(f"    LiveOut: {{{live_out_str}}}")
         print("    Instructions:")
@@ -284,8 +292,8 @@ def print_function(function: Function, idom: dict = None, dom_tree: dict = None)
                             val_idx = function.value_indices[var]
                             dist = get_next_use_distance(block, val_idx, i, function)
                         else:
-                            dist = float('inf')
-                        dist_str = "inf" if dist == float('inf') else str(int(dist))
+                            dist = U32_MAX
+                        dist_str = "inf" if dist == U32_MAX else str(dist)
                         next_uses.append(f"{var}:{dist_str}")
                     if next_uses:
                         next_use_str = f" next_use={{{', '.join(next_uses)}}}"

@@ -5,6 +5,9 @@ IR Classes for Simple SSA-like Intermediate Representation
 from dataclasses import dataclass, field
 from typing import List, Dict, Set, Tuple, Union, Optional
 
+# Use u32-style maximum to represent "infinity" for next-use distances.
+U32_MAX: int = (1 << 32) - 1
+
 
 @dataclass
 class ParseError(Exception):
@@ -82,14 +85,14 @@ class Block:
     instructions: List[Instruction]
     successors: List[str]
     predecessors: List[str]
-    live_in: Dict[int, float]
-    live_out:  Dict[int, float]
+    live_in: Dict[int, int]
+    live_out: Dict[int, int]
     use_set: Set[int]
     def_set: Set[int]
     phi_uses: Set[int]
     phi_defs: Set[int]
     max_register_pressure: int = 0
-    next_use_distances_by_val: Dict[int, List[float]] = None
+    next_use_distances_by_val: Dict[int, List[int]] = None
     loop_depth: int = 0
 
     def __init__(self, name: str):
@@ -119,7 +122,7 @@ class Block:
 class Function:
     name: str
     blocks: Dict[str, Block]
-    next_use_distances: Dict[Tuple[str, int], List[float]] = None
+    next_use_distances: Dict[Tuple[str, int], List[int]] = None
     value_indices: Dict[str, int] = None
 
     def __init__(self, name: str):

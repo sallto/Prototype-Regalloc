@@ -1,10 +1,9 @@
 # todo: non reducible control flow
-import math
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
-from ir import Block, Function, Op, Phi, val_as_phi
+from ir import Block, Function, Op, Phi, U32_MAX, val_as_phi
 
 
 @dataclass
@@ -396,7 +395,7 @@ def recompute_block_live_sets(
     # Compute live_out as the merged live_in from all successors, taking minimums
     # Start with phi_uses (values flowing into phis from this block)
     # Phi uses happen at successor entry, so distance is 0 from block exit
-    live_out: Dict[int, float] = {val_idx: 0 for val_idx in block.phi_uses}
+    live_out: Dict[int, int] = {val_idx: 0 for val_idx in block.phi_uses}
 
     for succ in block.successors:
         succ_block = function.blocks[succ]
@@ -420,7 +419,7 @@ def recompute_block_live_sets(
     block.live_out = live_out
 
     # Accumulate live_in during reverse traversal; defer set filtering to the end
-    live_in_work: Dict[int, float] = dict(block.live_out)
+    live_in_work: Dict[int, int] = dict(block.live_out)
 
     # Initialize per-value use position collection
     block.next_use_distances_by_val = {}
@@ -448,7 +447,7 @@ def recompute_block_live_sets(
                     uses_set.add(use_idx)
                     # Update live_in distance for this use
                     live_in_work[use_idx] = min(
-                        live_in_work.get(use_idx, float("inf")), i
+                        live_in_work.get(use_idx, U32_MAX), i
                     )
                     # Collect use positions for per-value analysis (all uses, not just live_in)
                     if use_idx not in block.next_use_distances_by_val:
@@ -498,8 +497,8 @@ def recompute_block_live_sets(
     }
     for val_idx in block.use_set:
         block.live_in[val_idx] = min(
-            block.live_in.get(val_idx, float("inf")),
-            live_in_work.get(val_idx, float("inf")),
+            block.live_in.get(val_idx, U32_MAX),
+            live_in_work.get(val_idx, U32_MAX),
         )
 
     # Adjust live_in distances for pass-through variables
@@ -517,7 +516,7 @@ def recompute_block_live_sets(
             use_positions.append(block_len + block.live_out[val_idx])
         else:
             # Not live out, append infinity as the last entry
-            use_positions.append(math.inf)
+            use_positions.append(U32_MAX)
 
     for val_idx in block.live_out:
         # Only add if not already processed above
@@ -586,8 +585,8 @@ def propagate_loop_liveness_and_distances(
             block = function.blocks[block_name]
             for val_idx in loop_live_vars:
                 if val_idx not in block.def_set and val_idx not in block.phi_defs:
-                    block.live_in[val_idx] = block.live_in.get(val_idx, float("inf"))
-                block.live_out[val_idx] = block.live_out.get(val_idx, float("inf"))
+                    block.live_in[val_idx] = block.live_in.get(val_idx, U32_MAX)
+                block.live_out[val_idx] = block.live_out.get(val_idx, U32_MAX)
             affected_blocks.add(block_name)
 
         # Recurse into child loops
@@ -683,7 +682,7 @@ def propagate_loop_liveness_and_distances(
                     val_idx not in header_block.def_set
                     and val_idx not in header_block.phi_defs
                 ):
-                    if d < header_block.live_in.get(val_idx, math.inf):
+                    if d < header_block.live_in.get(val_idx, U32_MAX):
                         header_block.live_in[val_idx] = d
 
     for block_name in affected_blocks:
@@ -692,7 +691,7 @@ def propagate_loop_liveness_and_distances(
 
 def get_next_use_distance(
     block: Block, val_idx: int, current_idx: int, function: Function
-) -> float:
+) -> int:
     """
     Get the next-use distance for a variable at a given instruction index.
 
@@ -703,7 +702,7 @@ def get_next_use_distance(
         function: The function containing value_indices mapping
 
     Returns:
-        Distance to next use, or math.inf if no future use exists.
+        Distance to next use, or U32_MAX if no future use exists.
         Returns 0 if the variable is defined at the current instruction.
     """
     # Check if variable is defined at the current instruction
@@ -715,24 +714,25 @@ def get_next_use_distance(
                     def_var in function.value_indices
                     and function.value_indices[def_var] == val_idx
                 ):
-                    return 0.0
+                    return 0
         elif isinstance(current_instr, Phi):
             if (
                 current_instr.dest in function.value_indices
                 and function.value_indices[current_instr.dest] == val_idx
             ):
-                return 0.0
+                return 0
 
     if (
         not hasattr(block, "next_use_distances_by_val")
         or val_idx not in block.next_use_distances_by_val
     ):
-        return math.inf
+        return U32_MAX
     use_positions = block.next_use_distances_by_val[val_idx]
     for pos in use_positions:
         if pos >= current_idx:
-            return pos - current_idx
-    return math.inf
+            # Treat sentinel U32_MAX as infinity without subtracting to avoid wrap/huge finite distances.
+            return U32_MAX if pos == U32_MAX else pos - current_idx
+    return U32_MAX
 
 
 def compute_liveness(

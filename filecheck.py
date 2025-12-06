@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import liveness
 from liveness import get_next_use_distance
+from ir import U32_MAX
 from main import parse_function
 
 
@@ -672,8 +673,8 @@ def is_variable_live(block_name: str, var: str, instr_idx: int, function, spill_
         val_idx = function.value_indices[var]
         next_use_dist = get_next_use_distance(block, val_idx, original_instr_idx, function)
     else:
-        next_use_dist = float('inf')
-    if next_use_dist != float('inf'):
+        next_use_dist = U32_MAX
+    if next_use_dist != U32_MAX:
         return True
     
     # Check if variable is live-out (needed for successor blocks)

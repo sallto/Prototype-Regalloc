@@ -10,11 +10,10 @@ pressure exceeds the available number of registers k.
 """
 
 from collections import defaultdict
-import math
 import bisect
 from typing import Dict, List, Set, Union, Tuple, Optional
 from dataclasses import dataclass
-from ir import Function, Block, Op, Phi
+from ir import Function, Block, Op, Phi, U32_MAX
 from liveness import get_next_use_distance, compute_loop_membership_from_map, LoopInfo
 def topological_order(function: Function) -> List[str]:
     """
@@ -143,7 +142,7 @@ def limit(W: Set[int], S: Set[int], insn_idx: int, block: Block, m: int, spills:
     # Create spills for evicted variables that haven't been spilled before and have finite next use
     for val_idx in evicted_vars:
         next_use_dist = get_next_use_distance(block, val_idx, insn_idx, function)
-        if val_idx not in S and next_use_dist != math.inf:
+        if val_idx not in S and next_use_dist != U32_MAX:
             insert_spill_reload_sorted(spills, SpillReload("spill", val_idx, insn_idx, block.name))
 
     # Update S: remove evicted variables from the already spilled set
@@ -347,10 +346,10 @@ def sortByNextUse(vars: Set[int], entry_instr_idx: int, block: Block, function: 
     Returns:
         List of value indices sorted by next-use distance (closest first)
     """
-    def get_next_use_dist(val_idx: int) -> float:
+    def get_next_use_dist(val_idx: int) -> int:
         if hasattr(block, 'live_in') and isinstance(block.live_in, dict) and val_idx in block.live_in:
             return block.live_in[val_idx]
-        return float('inf')
+        return U32_MAX
 
     return sorted(vars, key=get_next_use_dist)
 
@@ -582,7 +581,7 @@ def insert_coupling_code_for_edge(pred_name: str, block_name: str, W_entry: Set[
         # Insert spills before reloads
         # Skip variables already in pred_S_exit - they can be silently evicted without a spill instruction
         for val_idx in vars_to_spill_for_reloads:
-            if val_idx not in pred_S_exit and get_next_use_distance(block, val_idx, 0, function) != math.inf:
+            if val_idx not in pred_S_exit and get_next_use_distance(block, val_idx, 0, function) != U32_MAX:
                 insert_spill_reload_sorted(result[pred_name], SpillReload("spill", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
     
     # Insert reload operations
@@ -592,7 +591,7 @@ def insert_coupling_code_for_edge(pred_name: str, block_name: str, W_entry: Set[
     # Spill: All variables in (S_entry \ S_exit_pred) ∩ W_exit_pred
     spill_vars = ((S_entry - pred_S_exit) & pred_W_exit)
     for val_idx in spill_vars:
-        if get_next_use_distance(block, val_idx, 0, function) != math.inf:
+        if get_next_use_distance(block, val_idx, 0, function) != U32_MAX:
             insert_spill_reload_sorted(result[pred_name], SpillReload("spill", val_idx, len(pred_block.instructions) - 1, pred_name, is_coupling=True, edge_info=f"{pred_name}->{block_name}"))
 
 
@@ -810,7 +809,7 @@ def is_last_use(val_idx: int, block: Block, instr_idx: int, function: Function) 
     # Use next_use_distance utility to check for further uses in the block.
     # next_use_distance returns None if there is no further use, otherwise returns the distance.
     next_use_distance = get_next_use_distance(block, val_idx, instr_idx, function)
-    if next_use_distance is not None and next_use_distance != math.inf:
+    if next_use_distance != U32_MAX:
         return False
     
     # No more uses found, this is the last use

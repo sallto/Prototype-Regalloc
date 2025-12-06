@@ -1,4 +1,4 @@
-from ir import Function, Block, Op, Phi
+from ir import Function, Block, Op, Phi, U32_MAX
 from typing import Dict, List, Set, Optional
 from min_algorithm import SpillReload, is_last_use
 import dominators
@@ -271,7 +271,7 @@ def choose_color_with_eviction(
                     if position < len(block.instructions)
                     else len(block.instructions) - 1
                 )
-                dist = float("inf")
+                dist = U32_MAX
                 if (
                     hasattr(block, "next_use_distances_by_val")
                     and v in block.next_use_distances_by_val
@@ -284,7 +284,7 @@ def choose_color_with_eviction(
                             found = True
                             break
                     if not found:
-                        dist = float("inf")
+                        dist = U32_MAX
                 # Prefer largest (furthest) distance, breaking ties by lowest variable index (for determinism)
                 if dist > max_dist or (
                     dist == max_dist
