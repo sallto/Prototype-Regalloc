@@ -32,8 +32,8 @@ block b3:
 ; CHECK-COLOR-K3 directives:
 ; CHECK-COLOR-K3: op defs=%v0->r0
 ; CHECK-COLOR-K3: jmp header
-; CHECK-COLOR-K3: phi %v1->r0 [b0, %v0, body, %v2]
+; CHECK-COLOR-K3: phi %v1->r1 [b0, %v0, body, %v2]
 ; CHECK-COLOR-K3: jmp body,b3
-; CHECK-COLOR-K3: op defs=%v2->r0
+; CHECK-COLOR-K3: op defs=%v2->r1
 ; CHECK-COLOR-K3: jmp header
-; CHECK-COLOR-K3: op uses=%v1
+; CHECK-COLOR-K3: op uses=%v1<-r1

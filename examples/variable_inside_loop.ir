@@ -29,5 +29,5 @@ block b3:
 ; CHECK-COLOR-K3: jmp header
 ; CHECK-COLOR-K3: op defs=%v0->r0
 ; CHECK-COLOR-K3: jmp body,b3
-; CHECK-COLOR-K3: op uses=%v0
+; CHECK-COLOR-K3: op uses=%v0<-r0
 ; CHECK-COLOR-K3: jmp header

@@ -29,4 +29,4 @@ block b3:
 ; CHECK-COLOR-K3: jmp b2
 ; CHECK-COLOR-K3: jmp b1,b3
 ; CHECK-COLOR-K3: jmp b2
-; CHECK-COLOR-K3: op uses=%v0
+; CHECK-COLOR-K3: op uses=%v0<-r0

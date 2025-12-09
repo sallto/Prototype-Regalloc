@@ -37,12 +37,12 @@ block b3:
 ; CHECK-COLOR-K3: op defs=%v0->r0
 ; CHECK-COLOR-K3: op defs=%v1->r1
 ; CHECK-COLOR-K3: op defs=%v2->r2
-; CHECK-COLOR-K3: op uses=%v0
+; CHECK-COLOR-K3: op uses=%v0<-r0
 ; CHECK-COLOR-K3: jmp b1
 ; CHECK-COLOR-K3: op defs=%v3->r2
-; CHECK-COLOR-K3: op uses=%v0
+; CHECK-COLOR-K3: op uses=%v0<-r0
 ; CHECK-COLOR-K3: jmp b2
 ; CHECK-COLOR-K3: op defs=%v4->r2
-; CHECK-COLOR-K3: op uses=%v0
+; CHECK-COLOR-K3: op uses=%v0<-r0
 ; CHECK-COLOR-K3: jmp b3
-; CHECK-COLOR-K3: op uses=%v1
+; CHECK-COLOR-K3: op uses=%v1<-r1

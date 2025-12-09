@@ -36,10 +36,10 @@ block b2:
 ; CHECK-COLOR-K3: op defs=%v0->r0
 ; CHECK-COLOR-K3: op defs=%v1->r1
 ; CHECK-COLOR-K3: op defs=%v2->r2
-; CHECK-COLOR-K3: op uses=%v0
+; CHECK-COLOR-K3: op uses=%v0<-r0
 ; CHECK-COLOR-K3: jmp b1,b2
-; CHECK-COLOR-K3: op uses=%v1,%v2 defs=%v4->r0
+; CHECK-COLOR-K3: op uses=%v1<-r1,%v2<-r2 defs=%v4->r0
 ; CHECK-COLOR-K3: jmp b2
 ; CHECK-COLOR-K3: phi %v6->r0 [b0, %v1, b1, %v4]
-; CHECK-COLOR-K3: op uses=%v2,%v6 defs=%v7->r1
-; CHECK-COLOR-K3: op uses=%v7
+; CHECK-COLOR-K3: op uses=%v2<-r2,%v6<-r0 defs=%v7->r1
+; CHECK-COLOR-K3: op uses=%v7<-r1
